@@ -1,0 +1,6 @@
+# dsh-ptt 运行依赖（Python 3.12 推荐；3.14 + pygame 2.6.1 在 macOS 会间歇崩溃）
+pygame>=2.5.2
+sounddevice>=0.4
+numpy>=1.24
+# 可选：有 pyaudio 时优先使用（需系统 PortAudio）
+# pyaudio

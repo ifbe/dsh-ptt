@@ -1,4 +1,32 @@
-# dsh-ptt bundle patch：本插件只被 ptt profile 引用，插件行及全部配置
-# 统一写在 profile 的 cordis.patch.yml（唯一配置文件，含 llm-deepseek 覆盖），
-# 避免重复注册（duplicate loader entry id: ptt）。
-[]
+# dsh-ptt bundle patch：插入 ptt 插件行（默认配置）
+# 用户 profile 的 cordis.patch.yml 用 `- id: ptt` + config 覆盖（qqbot 同款），
+# 不要重复 insert 同 id（会 duplicate loader entry）。
+
+- insert:
+    - id: ptt
+      name: 'dsh-ptt'
+      config:
+        # 默认配置（用户可在 profile 的 cordis.patch.yml 覆盖）
+        OMLX_BASE_URL: http://macmini.local:12345/v1
+        ASR_MODEL: Qwen3-ASR-0.6B-4bit
+        LLM_MODEL: Qwen3.6-35B-A3B-4bit
+        LLM_PROVIDER: omlx
+        SESSION_KEY: ptt-main
+        GAMEPAD_BACKEND: pygame
+        BUTTON_TALK: 0
+        BUTTON_CMD: 1
+        PYTHON_BIN: python3
+        RECORDER_BIN: rec
+        AUDIO_DEVICE: ":0"
+        SAMPLE_RATE: 16000
+        MAX_RECORD_SEC: 30
+        VOICE_NAME: Ting-Ting
+        SPEAK_REPLY: true
+        ASR_DEBUG: false
+        STOP_KEYWORDS: [stop, 停止, 别说了, 闭嘴, 停下]
+        RESET_KEYWORDS: [reset, 重置, 清空, 重来, 新会话]
+        MODEL_KEYWORDS: [model, 模型, 可用模型, 有哪些模型]
+        STATUS_KEYWORDS: [status, 状态, 当前状态]
+        HELP_KEYWORDS: [help, 帮助, 有什么命令, 有哪些命令]
+        COMPACT_KEYWORDS: [compact, 压缩, 压缩一下]
+        GOAL_KEYWORDS: [goal, 目标, 当前目标]

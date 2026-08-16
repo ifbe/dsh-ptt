@@ -1,8 +1,7 @@
 {
   "name": "dsh-ptt",
   "version": "0.1.0",
-  "private": true,
-  "description": "极简对讲机插件：手柄A键按住说话(ASR->DSH会话)，B键语音命令(stop/reset)",
+  "description": "极简对讲机插件：手柄A键按住说话(ASR->DSH会话)，B键语音命令(stop/reset/model/status/help/compact/goal)",
   "type": "module",
   "main": "./index.js",
   "exports": {
@@ -15,9 +14,6 @@
       "patch": "./cordis.patch.yml"
     }
   },
-  "dependencies": {
-    "node-hid": "^3.1.2"
-  },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.1",
     "@deepseek-ai/dsh-agent": ">=0.1.0-rc.6",
@@ -25,5 +21,17 @@
     "@deepseek-ai/dsh-session": ">=0.1.0-rc.6",
     "@deepseek-ai/schemastery": ">=3.18.1"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "session.js",
+    "speaker.js",
+    "asr.js",
+    "gamepad.js",
+    "bridge.py",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md",
+    "requirements.txt"
+  ]
 }
