@@ -1,0 +1,4 @@
+# dsh-ptt bundle patch：本插件只被 ptt profile 引用，插件行及全部配置
+# 统一写在 profile 的 cordis.patch.yml（唯一配置文件，含 llm-deepseek 覆盖），
+# 避免重复注册（duplicate loader entry id: ptt）。
+[]
