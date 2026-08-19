@@ -62,7 +62,8 @@ export class Speaker {
       } else if (evt.type === 'user/message') {
         detail = ` ${extractText(evt.data?.content).slice(0, 200)}`;
       } else if (evt.type === 'assistant/message') {
-        detail = ` ${extractText(evt.data?.message?.content).slice(0, 200)}`;
+        // 内容与 chunk 流重复，不打印具体内容
+        detail = '';
       } else if (evt.type === 'request/header') {
         const c = evt.data?.header?.config;
         detail = c ? ` provider=${c.provider} model=${c.model}` : '';
