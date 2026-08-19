@@ -32,6 +32,11 @@
     "cordis.patch.yml",
     "package.json",
     "README.md",
-    "requirements.txt"
-  ]
+    "requirements.txt",
+    "ws.js",
+    "out.js"
+  ],
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
