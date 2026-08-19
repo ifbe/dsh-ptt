@@ -7,7 +7,9 @@
 //   - reset()：切换到全新随机 sessionId 并记录 → 旧会话归档，新会话空白
 //   - "当前 sessionId" 记录在 profile 目录的 .ptt-session（ptt 自己的文件，不动 dsh 全局）
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -16,15 +18,199 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 状态文件：profile 目录（dsh-ptt 的上级）
 const STATE_FILE = path.join(HERE, '..', '.ptt-session');
 
+/**
+ * 检测同一 profile 内装了哪个聊天软件（IM）插件。
+ * 读 profile 的 package.json（dsh-ptt 的上级目录），检查 bundles/dependencies
+ * 里是否有 IM 插件包名。
+ * @param {object} ctx
+ * @returns {'qqbot'|'feishu'|'wechat'|null} 插件类型；null = 无（独立模式）
+ */
+export function detectImPlugin(ctx) {
+  // IM 插件包名 → 类型（飞书/微信装好后补充包名）
+  const IM_PACKAGES = {
+    '@tencent-connect/dsh-qqbot': 'qqbot',
+  };
+  try {
+    const profilePkg = JSON.parse(
+      fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'),
+    );
+    const bundles = profilePkg.dsh?.profile?.bundles ?? [];
+    const depNames = Object.keys(profilePkg.dependencies ?? {});
+    for (const name of [...bundles, ...depNames]) {
+      if (IM_PACKAGES[name]) return IM_PACKAGES[name];
+    }
+  } catch { /* 读不到或解析失败 → 视为无 IM */ }
+  return null;
+}
+
+/**
+ * 从持久化会话里匹配 IM（QQ）会话：
+ * 排除 ptt 自己的会话（SESSION_KEY 派生 + .ptt-session 记录的），
+ * 剩下的取最近创建的（用户场景只有一个 QQ 会话）。
+ * @param {object} ctx
+ * @param {string} pttSessionId ptt 主会话 id（用于排除）
+ * @param {string|null} pttStateId ptt 状态文件记录的会话 id（用于排除）
+ * @returns {Promise<{sessionId: string, createdAt: number}|null>}
+ */
+export async function matchImSession(ctx, pttSessionId, pttStateId) {
+  try {
+    const sessions = await ctx.sessionPersistence.list();
+    const others = sessions
+      .filter((s) => s.id !== pttSessionId && s.id !== pttStateId)
+      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    const latest = others[0];
+    return latest ? { sessionId: latest.id, createdAt: latest.createdAt ?? 0 } : null;
+  } catch { /* 枚举失败 → 无会话 */ }
+  return null;
+}
+
+/** 时间戳 → 可读时间（去掉 created= 前缀，直接显示） */
+function fmtTime(ts) {
+  if (!ts) return '?';
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 从会话日志文件提取 {model, title, empty}（zstd 解压，只读一遍） */
+function sessionFacts(logPath) {
+  const facts = { model: '?', title: '', empty: true };
+  try {
+    const out = execFileSync('zstd', ['-dc', logPath], { maxBuffer: 32 * 1024 * 1024 });
+    const text = out.toString('utf8');
+    const lines = text.split('\n');
+    // empty：是否没有任何用户消息（source.kind=user 的 user/message）
+    facts.empty = !lines.some(
+      (l) => l.includes('"user/message"') && l.includes('"kind":"user"'),
+    );
+    // model：最后一个 request/header 的 config
+    const headers = lines.filter((l) => l.includes('"request/header"'));
+    const m = headers[headers.length - 1]?.match(/"config":\{"provider":"([^"]*)","model":"([^"]*)"/);
+    if (m) facts.model = `${m[1]}/${m[2]}`;
+    // title：最后一个 session/title 事件
+    const titles = lines.filter((l) => l.includes('"type":"session/title"'));
+    const tm = titles[titles.length - 1]?.match(/"title":"([^"]*)"/);
+    if (tm) facts.title = tm[1];
+  } catch { /* 读不到 → 默认 */ }
+  return facts;
+}
+
+/** 完整格式（全部会话用）：uuid/time/model/dir/subagent/archived/empty/title */
+function describeSessionFull(a, archived) {
+  const h = a.header ?? a;
+  const f = a.path ? sessionFacts(a.path) : { model: '?', title: '', empty: true };
+  const subagent = h.origin === 'subagent' || (h.delegationDepth ?? 0) > 0;
+  return `uuid=${h.id} time=${fmtTime(h.createdAt)} model=${f.model} dir=${h.cwd ?? ''} subagent=${subagent ? 'true' : 'false'} archived=${archived ? 'true' : 'false'} empty=${f.empty ? 'true' : 'false'} title=${f.title}`;
+}
+
+/** 简洁格式（排序列表用）：uuid/time/model/dir/title */
+function describeSessionSimple(a) {
+  const h = a.header ?? a;
+  const f = a.path ? sessionFacts(a.path) : { model: '?', title: '' };
+  return `uuid=${h.id} time=${fmtTime(h.createdAt)} model=${f.model} dir=${h.cwd ?? ''} title=${f.title}`;
+}
+
+/** 会话是否空白（无用户消息） */
+function isEmptySession(a) {
+  const h = a.header ?? a;
+  return a.path ? sessionFacts(a.path).empty : true;
+}
+
+/** 是否子代理会话 */
+function isSubagent(a) {
+  const h = a.header ?? a;
+  return h.origin === 'subagent' || (h.delegationDepth ?? 0) > 0;
+}
+
+/**
+ * 启动时会话管理（按用户伪代码）：
+ *   1. 日志打印所有会话
+ *   2. 排序后再打印
+ *   3. 分支：qqbot 存在 → 尝试匹配 QQ 会话；
+ *           飞书/微信存在 → 当前无行为（绑定未实现）；
+ *           都没有 → 独立模式
+ * @param {object} ctx
+ * @param {SessionBridge} bridge
+ * @returns {Promise<{mode:'assist'|'standalone', imSession:object|null}>}
+ */
+export async function manageSessions(ctx, bridge) {
+  let artifacts = [];
+  try {
+    artifacts = await ctx.sessionPersistence.listArtifacts();
+  } catch (err) {
+    console.warn(`[ptt] ⚠️ 枚举会话失败: ${err?.message ?? err}`);
+  }
+  // 归档会话：读 DSH 全局 workspace.json（ptt profile 无 workspaceRegistry 服务）
+  let archivedSet = new Set();
+  try {
+    const dshHome = process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
+    const ws = JSON.parse(fs.readFileSync(path.join(dshHome, 'storages', 'workspace.json'), 'utf8'));
+    archivedSet = new Set(ws.global?.archivedSessionIds ?? []);
+  } catch { /* 读不到 → 全部未归档 */ }
+
+  // 1) 打印所有会话（完整格式）
+  console.log(`[ptt] 📋 全部会话（${artifacts.length} 个）:`);
+  for (const a of artifacts) console.log('   ' + describeSessionFull(a, archivedSet.has(a.header.id)));
+
+  // 2) 排序（按创建时间倒序）后打印：过滤归档 + 子代理 + 空白会话
+  const active = artifacts.filter(
+    (a) => !archivedSet.has(a.header.id) && !isSubagent(a) && !isEmptySession(a),
+  );
+  const sorted = [...active].sort((a, b) => (b.header.createdAt ?? 0) - (a.header.createdAt ?? 0));
+  console.log(`[ptt] 📋 可用会话（按创建时间倒序，${sorted.length} 个）:`);
+  for (const a of sorted) console.log('   ' + describeSessionSimple(a));
+
+  // 3) 模式分支
+  const im = detectImPlugin(ctx);
+  if (im === 'qqbot') {
+    console.log('[ptt] 🎙️ 检测到 qqbot 插件，尝试匹配 QQ 会话...');
+    const pttId = bridge.defaultSessionId();
+    const pttState = bridge.readStateId();
+    const qq = await matchImSession(ctx, pttId, pttState);
+    if (qq) {
+      bridge.bindImSession(qq);
+      console.log(`[ptt] 🎙️ 辅助模式：匹配到 QQ 会话 ${qq.sessionId.slice(0, 12)}…（不创建 ptt 会话）`);
+      return { mode: 'assist', imSession: qq };
+    }
+    console.log('[ptt] 🎙️ 辅助模式：未找到 QQ 会话（语音将提示"会话不存在"）');
+    return { mode: 'assist', imSession: null };
+  }
+  if (im === 'feishu' || im === 'wechat') {
+    console.log(`[ptt] 🎙️ 检测到 ${im} 插件：绑定未实现，当前无行为`);
+    return { mode: 'assist', imSession: null };
+  }
+  console.log('[ptt] 🎙️ 独立模式：无聊天软件插件，使用 ptt 自己的会话');
+  return { mode: 'standalone', imSession: null };
+}
+
 export class SessionBridge {
-  /** @param {object} agents ctx.agents @param {object} config @param {object} llm ctx.llm @param {object} ctx */
-  constructor(agents, config, llm, ctx) {
+  /**
+   * @param {object} agents ctx.agents
+   * @param {object} config
+   * @param {object} llm ctx.llm
+   * @param {object} ctx
+   * @param {boolean} hasIm 同 profile 是否装了聊天软件插件（true=辅助模式，false=独立模式）
+   */
+  constructor(agents, config, llm, ctx, hasIm = false) {
     this.agents = agents;
     this.config = config;
     this.llm = llm;
     this.ctx = ctx;
-    this.record = null; // {agent, handle}
-    this.sessionId = null;
+    this.hasIm = hasIm; // 有 IM 插件 = 辅助模式（不创建 ptt 会话）
+    this.record = null; // {agent, handle}（独立模式用）
+    this.sessionId = null; // 独立模式的会话 id
+    this.imSession = null; // 辅助模式当前绑定的 IM 会话（可能为 null=无会话）
+  }
+
+  /** 是否辅助模式（装了 IM 插件即辅助，会话可有可无） */
+  get isAssist() {
+    return this.hasIm;
+  }
+
+  /** 绑定 IM 会话（辅助模式）：设置模式 + 会话 */
+  bindImSession(session) {
+    this.hasIm = true;
+    this.imSession = session;
   }
 
   /** omlx provider 是否已注册（网页端 Models 页管理） */
@@ -108,6 +294,12 @@ export class SessionBridge {
   /** 启动/首次：恢复会话（带历史），没有则创建。返回 {agent, handle} */
   async ensure() {
     if (this.record) return this.record;
+    // 辅助模式：不创建/恢复 ptt 会话，实时找 IM 会话；无会话返回 null
+    if (this.isAssist) {
+      const im = this.findImSession();
+      this.imSession = im;
+      return im ? { agent: im.agent } : null;
+    }
     const sessionId = this.readStateId() ?? this.defaultSessionId();
     this.sessionId = sessionId;
     // 先试 session-own：不传 agentOptions，看 agent 是否自带模型
@@ -153,28 +345,47 @@ export class SessionBridge {
 
   /** 当前会话状态概要（status 命令用） */
   getStatus() {
-    const opts = this.record?.agent?.options ?? {};
-    const model = this.modelOf(this.record?.agent);
+    if (this.isAssist) {
+      const im = this.findImSession();
+      return {
+        mode: 'assist',
+        sessionId: im ? im.sessionId.slice(0, 12) : null,
+        model: im ? this.modelOf(im.agent) : null,
+        active: !!im,
+      };
+    }
     return {
+      mode: 'standalone',
       sessionId: this.sessionId ? this.sessionId.slice(0, 12) : null,
-      model,
+      model: this.modelOf(this.record?.agent),
       active: !!this.record,
     };
   }
 
-  /** A键语音 → 正常对话 */
+  /**
+   * A键语音 → 正常对话。
+   * 返回 {ok:true} 已发送；{noSession:true} 辅助模式且无 IM 会话（调用方播报提示）。
+   */
   async talk(text) {
-    const { agent } = await this.ensure();
-    agent.followup(
+    const rec = await this.ensure();
+    if (!rec) return { noSession: true };
+    rec.agent.followup(
       createUserMessage({
         content: [{ type: 'text', text }],
         source: { kind: 'user' },
       }),
     );
+    return { ok: true };
   }
 
   /** B键语音命令 → 中断当前回复 */
   stop() {
+    if (this.isAssist) {
+      const im = this.findImSession();
+      if (!im) return false;
+      im.agent.cancel({ kind: 'user' });
+      return true;
+    }
     if (!this.record) return false;
     this.record.agent.cancel({ kind: 'user' });
     return true;
@@ -182,6 +393,10 @@ export class SessionBridge {
 
   /** B键语音命令 → 清空上下文：切换到全新会话并记录 */
   async reset() {
+    if (this.isAssist) {
+      // 辅助模式：不重置 IM 会话（QQ 会话生命周期由 IM 插件管），返回 false 由调用方提示
+      return false;
+    }
     const old = this.record;
     this.record = null;
     if (old) {

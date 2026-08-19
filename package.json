@@ -28,7 +28,7 @@
     "speaker.js",
     "asr.js",
     "gamepad.js",
-    "bridge.py",
+    "gamepad.py",
     "cordis.patch.yml",
     "package.json",
     "README.md",

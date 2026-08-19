@@ -108,7 +108,7 @@ function startNodeHid(handlers, config) {
 function startPyBridge(handlers, config) {
   const pythonBin = config.PYTHON_BIN ?? 'python3';
   const proc = spawn(pythonBin, [
-    path.join(here, 'bridge.py'),
+    path.join(here, 'gamepad.py'),
     String(config.BUTTON_TALK ?? 0),
     String(config.BUTTON_CMD ?? 1),
   ], {
