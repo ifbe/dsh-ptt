@@ -7,15 +7,24 @@ import fs from 'node:fs';
  * @returns {Promise<string>} 识别文本（可能为空串）
  */
 export async function transcribe(wavPath, config) {
+  if (config.PTT_ASR === 'none') {
+    throw new Error('PTT_ASR=none：ASR 未启用');
+  }
+  // ASR 端点/路径/key/模型：PTT_ASR_* 环境变量优先，回退配置文件
+  const baseUrl = (config.PTT_ASR_URL || config.OMLX_BASE_URL || '').replace(/\/$/, '');
+  const apiPath = config.PTT_ASR_API === 'transcribe' ? '/audio/transcriptions' : `/${String(config.PTT_ASR_API).replace(/^\//, '')}`;
+  const apiKey = config.PTT_ASR_KEY || config.OMLX_API_KEY || process.env.OMLX_API_KEY || '';
+  const model = config.PTT_ASR_MODEL || config.ASR_MODEL;
+
   const buf = fs.readFileSync(wavPath);
   const form = new FormData();
   form.append('file', new Blob([buf], { type: 'audio/wav' }), 'rec.wav');
-  form.append('model', config.ASR_MODEL);
+  form.append('model', model);
   form.append('stream', 'true');
 
-  const res = await fetch(`${config.OMLX_BASE_URL}/audio/transcriptions`, {
+  const res = await fetch(`${baseUrl}${apiPath}`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${config.OMLX_API_KEY ?? process.env.OMLX_API_KEY}` },
+    headers: { Authorization: `Bearer ${apiKey}` },
     body: form,
     signal: AbortSignal.timeout(30000),
   });

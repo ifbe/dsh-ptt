@@ -79,9 +79,23 @@ export function startWs({ onText, onWav, onSpeak }, url, logger = console) {
   const broadcastSpeak = (text) => {
     for (const client of wss.clients) send(client, { type: 'speak', text });
   };
+  // 文本输出（OUTPUT_TEXT=ws）：模型回复文本
+  const broadcastText = (text) => {
+    for (const client of wss.clients) send(client, { type: 'text', text });
+  };
+  // 语音 wav 输出（OUTPUT_AUDIO=ws）：直接发二进制 wav 帧（客户端识别为 audio）
+  const broadcastAudio = (buf) => {
+    for (const client of wss.clients) {
+      try {
+        client.send(buf, { binary: true });
+      } catch { /* 客户端断开 */ }
+    }
+  };
 
   return {
     broadcastSpeak,
+    broadcastText,
+    broadcastAudio,
     dispose() {
       try {
         for (const client of wss.clients) client.close();

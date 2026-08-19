@@ -3,8 +3,12 @@
 //
 // 所有配置来自 profile 的 cordis.patch.yml（ptt 行的 config 段）——
 // 那是本插件的唯一配置文件，只影响 ptt profile，不影响其他 profile。
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import readline from 'node:readline';
 import { startGamepad } from './gamepad.js';
 import { startWs } from './ws.js';
+import { createOutputQueue } from './out.js';
 import { transcribe } from './asr.js';
 import { SessionBridge, manageSessions } from './session.js';
 import { Speaker } from './speaker.js';
@@ -56,11 +60,11 @@ async function showModels(ctx, speaker) {
         lines.push(`${p.name ?? p.id}: (模型列表不可用)`);
       }
     }
-    console.log('[ptt] 📋 当前可用模型:');
-    for (const l of lines) console.log('   ' + l);
+    out.log('[ptt] 📋 当前可用模型:');
+    for (const l of lines) out.log('   ' + l);
     speaker.say(`共有 ${providers.length} 个模型提供方`);
   } catch (err) {
-    console.error(`[ptt] ❌ 查询模型失败: ${err?.message ?? err}`);
+    out.error(`[ptt] ❌ 查询模型失败: ${err?.message ?? err}`);
     speaker.say('查询模型失败');
   }
 }
@@ -69,7 +73,7 @@ async function showModels(ctx, speaker) {
 async function showStatus(bridge, speaker) {
   const st = bridge.getStatus();
   const modeLabel = st.mode === 'assist' ? '辅助(聊天软件会话)' : '独立(ptt会话)';
-  console.log(`[ptt] 📊 状态: 模式=${modeLabel} 会话=${st.sessionId ?? '无'} 模型=${st.model ?? '无'} 活跃=${st.active}`);
+  out.log(`[ptt] 📊 状态: 模式=${modeLabel} 会话=${st.sessionId ?? '无'} 模型=${st.model ?? '无'} 活跃=${st.active}`);
   speaker.say(`当前模式 ${modeLabel}，会话 ${st.sessionId ?? '无'}`);
 }
 
@@ -84,8 +88,8 @@ async function showHelp(speaker) {
     '状态：当前会话信息',
     '帮助：列出命令',
   ];
-  console.log('[ptt] 📖 语音命令:');
-  for (const c of cmds) console.log('   ' + c);
+  out.log('[ptt] 📖 语音命令:');
+  for (const c of cmds) out.log('   ' + c);
   speaker.say('可用命令：停止、重置、模型、压缩、目标、状态、帮助');
 }
 
@@ -94,7 +98,7 @@ async function runDshCommand(ctx, bridge, line, speaker) {
   try {
     const rec = await bridge.ensure();
     if (!rec) {
-      console.log(`[ptt] ⚠️ 无会话：无法执行 ${line}`);
+      out.log(`[ptt] ⚠️ 无会话：无法执行 ${line}`);
       speaker.say('会话不存在');
       return;
     }
@@ -102,15 +106,15 @@ async function runDshCommand(ctx, bridge, line, speaker) {
     const signal = new AbortController().signal;
     const result = await ctx.commands.execute(agent, line, signal);
     if (!result) {
-      console.log(`[ptt] ❓ 命令 ${line} 未识别`);
+      out.log(`[ptt] ❓ 命令 ${line} 未识别`);
       speaker.say('命令未识别');
       return;
     }
     const text = result.result?.text ?? JSON.stringify(result.result);
-    console.log(`[ptt] 💬 ${line}: ${text}`);
+    out.log(`[ptt] 💬 ${line}: ${text}`);
     speaker.say(text.slice(0, 80));
   } catch (err) {
-    console.error(`[ptt] ❌ 命令执行失败: ${err?.message ?? err}`);
+    out.error(`[ptt] ❌ 命令执行失败: ${err?.message ?? err}`);
     speaker.say('命令执行失败');
   }
 }
@@ -132,26 +136,60 @@ export async function apply(ctx, config) {
   const agents = ctx.agents;
   const logger = ctx.logger ?? console;
   const cfg = { ...DEFAULTS, ...(config ?? {}) };
+  const out = createOutputQueue(); // 全局 stdout 队列（输入/输出共用，防交错）
 
-  // ── 环境变量（大写，export 提供；未设则用默认）──
+  // ── 环境变量（PTT_ 前缀防冲突，export 提供；未设则用默认）──
   const ENV_DEFAULTS = {
-    INPUT_BUTTON: 'gamepad',   // 按钮输入：gamepad(手柄) | none
-    INPUT_AUDIO: 'mic',        // 音频输入：mic(麦克风) | ws
-    OUTPUT_TEXT: 'stdout',     // 文本输出：stdout(终端) | none
-    OUTPUT_AUDIO: 'speaker',   // 语音输出：speaker(say) | ws
-    WS_URL: '',                // ws 输入/输出地址（INPUT_AUDIO=ws 或 OUTPUT_AUDIO=ws 时必填）
+    PTT_INPUT_TEXT: 'stdin',       // 文本输入：stdin(回车一行) | ws | none
+    PTT_INPUT_AUDIO: 'gamepad',    // 音频输入：gamepad(手柄+录音,gamepad.py) | mic(纯麦克风) | ws | none
+    PTT_OUTPUT_TEXT: 'stdout',     // 文本输出：stdout(终端) | ws | none
+    PTT_OUTPUT_AUDIO: 'say',       // 语音输出：say(macOS) | ws | none
+    PTT_MODEL: '',                 // LLM 模型 provider/model（如 omlx/Qwen3.6-35B-A3B-4bit），空=用配置
+    PTT_WS_URL: '',                // ws 输入/输出地址（PTT_INPUT_AUDIO=ws 或 PTT_OUTPUT_AUDIO=ws 时必填）
+    PTT_TTS: 'say',                // 语音合成：say(macOS) | none
+    PTT_ASR: 'openai',             // ASR 方式：openai(OpenAI 兼容) | none
+    PTT_ASR_URL: '',               // ASR 端点（默认用 OMLX_BASE_URL）
+    PTT_ASR_API: 'transcribe',     // ASR API 路径（transcribe = /audio/transcriptions）
+    PTT_ASR_KEY: '',               // ASR key（默认用 OMLX_API_KEY）
+    PTT_ASR_MODEL: '',             // ASR 模型名（默认用 ASR_MODEL）
   };
+  // 读取原始值 → 计算最终采用（env 优先 → 默认；ASR 空值回退配置）
+  const envRaw = {};
+  for (const name of Object.keys(ENV_DEFAULTS)) {
+    envRaw[name] = process.env[name] ?? '(未设置)';
+  }
   const env = {};
   for (const [name, def] of Object.entries(ENV_DEFAULTS)) {
-    const raw = process.env[name];
-    console.log(`[ptt] env ${name}=${raw ?? '(未设置)'} → 采用: ${raw ?? def}`);
-    env[name] = raw ?? def;
+    env[name] = process.env[name] ?? def;
   }
-  cfg.INPUT_BUTTON = env.INPUT_BUTTON;
-  cfg.INPUT_AUDIO = env.INPUT_AUDIO;
-  cfg.OUTPUT_TEXT = env.OUTPUT_TEXT;
-  cfg.OUTPUT_AUDIO = env.OUTPUT_AUDIO;
-  cfg.WS_URL = env.WS_URL;
+  env.PTT_ASR_URL ||= cfg.OMLX_BASE_URL ?? '';
+  env.PTT_ASR_KEY ||= cfg.OMLX_API_KEY ?? '';
+  env.PTT_ASR_MODEL ||= cfg.ASR_MODEL ?? '';
+  // PTT_MODEL=provider/model → 覆盖 LLM 配置
+  if (env.PTT_MODEL) {
+    const slash = env.PTT_MODEL.indexOf('/');
+    if (slash > 0 && slash < env.PTT_MODEL.length - 1) {
+      cfg.LLM_PROVIDER = env.PTT_MODEL.slice(0, slash);
+      cfg.LLM_MODEL = env.PTT_MODEL.slice(slash + 1);
+    } else {
+      out.log(`[ptt] ⚠️ PTT_MODEL 格式错误（应为 provider/model）: ${env.PTT_MODEL}`);
+    }
+  }
+  // 同一行打印：读取值 + 最终值
+  for (const name of Object.keys(ENV_DEFAULTS)) {
+    out.log(`[ptt] env ${name} 读取=${envRaw[name]} 最终=${env[name] || '(空)'}`);
+  }
+  cfg.INPUT_AUDIO = env.PTT_INPUT_AUDIO;
+  cfg.INPUT_TEXT = env.PTT_INPUT_TEXT;
+  cfg.OUTPUT_TEXT = env.PTT_OUTPUT_TEXT;
+  cfg.OUTPUT_AUDIO = env.PTT_OUTPUT_AUDIO;
+  cfg.WS_URL = env.PTT_WS_URL;
+  cfg.PTT_TTS = env.PTT_TTS;
+  cfg.PTT_ASR = env.PTT_ASR;
+  cfg.PTT_ASR_URL = env.PTT_ASR_URL;
+  cfg.PTT_ASR_API = env.PTT_ASR_API;
+  cfg.PTT_ASR_KEY = env.PTT_ASR_KEY;
+  cfg.PTT_ASR_MODEL = env.PTT_ASR_MODEL;
 
   // 启动自检：确认 LLM 凭据可解析
   // （OMLX_API_KEY 存在 ~/.dsh/.credentials.yaml，llm-deepseek 的 apiKeyEnv 指向它）
@@ -159,20 +197,23 @@ export async function apply(ctx, config) {
   try {
     const cred = ctx.get('credentials');
     const hit = cred ? await cred.resolve('OMLX_API_KEY') : undefined;
-    console.log(`[ptt] LLM 凭据: ${hit ? `OK (来源: ${hit.source ?? '未知'})` : '❌ 缺失'}`);
+    out.log(`[ptt] LLM 凭据: ${hit ? `OK (来源: ${hit.source ?? '未知'})` : '❌ 缺失'}`);
   } catch (err) {
-    console.log(`[ptt] LLM 凭据检查失败: ${err?.message ?? err}`);
+    out.log(`[ptt] LLM 凭据检查失败: ${err?.message ?? err}`);
   }
 
   // ── 启动时会话管理：打印全部会话 → 排序打印 → 模式分支 ──
   const bridge = new SessionBridge(agents, cfg, ctx.llm, ctx);
-  const speaker = new Speaker(cfg);
+  const speaker = new Speaker(cfg, (replyText) => {
+    // 文本输出回调（turn/end 时）：OUTPUT_TEXT=ws → 广播；none → 不处理
+    if (cfg.OUTPUT_TEXT === 'ws') wsChannel.broadcastText(replyText);
+  }, out);
   const { mode } = await manageSessions(ctx, bridge);
 
   if (mode === 'standalone') {
     // 独立模式：启动即恢复/创建 ptt 自己的会话
     bridge.ensure().catch((err) => {
-      console.error(`[ptt] ⚠️ 会话初始化失败: ${err?.message ?? err}`);
+      out.error(`[ptt] ⚠️ 会话初始化失败: ${err?.message ?? err}`);
     });
   }
   // 辅助模式：不创建 ptt 会话，只绑定 IM 会话（无会话时 ASR 会提示）
@@ -185,51 +226,49 @@ export async function apply(ctx, config) {
   let chain = Promise.resolve();
   const runOnce = (fn) => {
     chain = chain.then(fn).catch((err) => {
-      console.error(`[ptt] ${err?.message ?? err}`);
+      out.error(`[ptt] ${err?.message ?? err}`);
     });
     return chain;
   };
 
-  // 通用：文本输入（ws 文本 / 语音 ASR 结果）→ 正常对话
-  const handleTextInput = (text) =>
-    runOnce(async () => {
-      if (!text) return;
-      console.log(`[ptt] 📤 发给模型: ${text}`);
-      console.log('');
-      const r = await bridge.talk(text);
-      if (r.noSession) {
-        console.log('[ptt] ⚠️ 无会话：请先在聊天软件发条消息');
-        speaker.say('会话不存在，请先在聊天软件发消息');
-      }
-    });
+  // 通用：文本输入（ws 文本 / 语音 ASR 结果 / stdin）→ 正常对话
+  // 注意：不做 runOnce（由事件入口统一串行，避免嵌套 runOnce 死锁）
+  const handleTextInput = async (text) => {
+    if (!text) return;
+    out.log(`[ptt] 📤 发给模型: ${text}`);
+    out.log('');
+    const r = await bridge.talk(text);
+    if (r.noSession) {
+      out.log('[ptt] ⚠️ 无会话：请先在聊天软件发条消息');
+      speaker.say('会话不存在，请先在聊天软件发消息');
+    }
+  };
 
-  // 通用：wav → ASR → 正常对话
-  const handleWavInput = (wav) =>
-    runOnce(async () => {
-      if (!wav) return;
-      console.log('[ptt] 🎯 ASR 识别中...');
-      const text = await transcribe(wav, cfg);
-      console.log(`[ptt] 📝 ASR: ${text}`);
-      if (cfg.ASR_DEBUG) {
-        console.log('[ptt] 🔧 调试模式：结果未发给模型');
-        return;
-      }
-      await handleTextInput(text);
-    });
+  // 通用：wav → ASR → 正常对话（不做 runOnce，由事件入口统一串行）
+  const handleWavInput = async (wav) => {
+    if (!wav) return;
+    out.log('[ptt] 🎯 ASR 识别中...');
+    const text = await transcribe(wav, cfg);
+    out.log(`[ptt] 📝 ASR: ${text}`);
+    if (cfg.ASR_DEBUG) {
+      out.log('[ptt] 🔧 调试模式：结果未发给模型');
+      return;
+    }
+    await handleTextInput(text);
+  };
 
-  // 通用：wav → ASR → 语音命令（B键逻辑）
-  const handleWavCommand = (wav) =>
-    runOnce(async () => {
-      if (!wav) return;
-      console.log('[ptt] 🎯 ASR 识别中...');
-      const text = await transcribe(wav, cfg);
-      console.log(`[ptt] 📝 ASR: ${text}`);
-      if (cfg.ASR_DEBUG) {
-        console.log('[ptt] 🔧 调试模式：未执行命令');
-        return;
-      }
-      await handleCommand(text);
-    });
+  // 通用：wav → ASR → 语音命令（B键逻辑，不做 runOnce）
+  const handleWavCommand = async (wav) => {
+    if (!wav) return;
+    out.log('[ptt] 🎯 ASR 识别中...');
+    const text = await transcribe(wav, cfg);
+    out.log(`[ptt] 📝 ASR: ${text}`);
+    if (cfg.ASR_DEBUG) {
+      out.log('[ptt] 🔧 调试模式：未执行命令');
+      return;
+    }
+    await handleCommand(text);
+  };
 
   // 通用：执行语音/文本命令（B键 / ws /命令）
   const handleCommand = async (text) => {
@@ -244,22 +283,22 @@ export async function apply(ctx, config) {
       await runDshCommand(ctx, bridge, cmd === 'compact' ? '/compact' : '/goal', speaker);
     } else if (cmd === 'stop') {
       if (bridge.stop()) {
-        console.log('[ptt] ⏹️ 已发送停止');
+        out.log('[ptt] ⏹️ 已发送停止');
         speaker.say('已停止');
       } else {
-        console.log('[ptt] ⚠️ 无会话可停止');
+        out.log('[ptt] ⚠️ 无会话可停止');
         speaker.say('会话不存在');
       }
     } else if (cmd === 'reset') {
       if (await bridge.reset()) {
-        console.log('[ptt] 🔄 会话已重置（上下文清空）');
+        out.log('[ptt] 🔄 会话已重置（上下文清空）');
         speaker.say('会话已重置');
       } else {
-        console.log('[ptt] ⚠️ 无法重置（辅助模式不重置聊天会话，或无会话）');
+        out.log('[ptt] ⚠️ 无法重置（辅助模式不重置聊天会话，或无会话）');
         speaker.say('无法重置');
       }
     } else {
-      console.log(`[ptt] ❓ 未识别的命令: "${text}"（试试: ${[...cfg.STOP_KEYWORDS, ...cfg.RESET_KEYWORDS].slice(0, 6).join(' / ')}）`);
+      out.log(`[ptt] ❓ 未识别的命令: "${text}"（试试: ${[...cfg.STOP_KEYWORDS, ...cfg.RESET_KEYWORDS].slice(0, 6).join(' / ')}）`);
       speaker.say('未识别命令');
     }
   };
@@ -267,15 +306,15 @@ export async function apply(ctx, config) {
   // A键：py 层已录音生成 wav → ASR → 正常对话
   const onTalkUp = (wav) =>
     runOnce(async () => {
-      console.log(`[ptt] 录音完成（a键，${wav ?? '无有效音频'}）`);
+      out.log(`[ptt] 录音完成（a键，${wav ?? '无有效音频'}）`);
       if (!wav) {
         return;
       }
-      console.log('[ptt] 🎯 ASR 识别中...');
+      out.log('[ptt] 🎯 ASR 识别中...');
       const text = await transcribe(wav, cfg);
-      console.log(`[ptt] 📝 ASR: ${text}`);
+      out.log(`[ptt] 📝 ASR: ${text}`);
       if (cfg.ASR_DEBUG) {
-        console.log('[ptt] 🔧 调试模式：结果未发给模型');
+        out.log('[ptt] 🔧 调试模式：结果未发给模型');
         return;
       }
       if (text) {
@@ -286,15 +325,15 @@ export async function apply(ctx, config) {
   // B键：py 层已录音生成 wav → ASR → 语音命令（不进模型）
   const onCmdUp = (wav) =>
     runOnce(async () => {
-      console.log(`[ptt] 录音完成（b键，${wav ?? '无有效音频'}）`);
+      out.log(`[ptt] 录音完成（b键，${wav ?? '无有效音频'}）`);
       if (!wav) {
         return;
       }
-      console.log('[ptt] 🎯 ASR 识别中...');
+      out.log('[ptt] 🎯 ASR 识别中...');
       const text = await transcribe(wav, cfg);
-      console.log(`[ptt] 📝 ASR: ${text}`);
+      out.log(`[ptt] 📝 ASR: ${text}`);
       if (cfg.ASR_DEBUG) {
-        console.log('[ptt] 🔧 调试模式：未执行命令');
+        out.log('[ptt] 🔧 调试模式：未执行命令');
         return;
       }
       await handleCommand(text);
@@ -302,21 +341,23 @@ export async function apply(ctx, config) {
 
   // ── 输入装配：按钮（手柄）+ 音频（mic/ws）+ ws ──
   let gamepad = { ready: new Promise(() => {}), dispose() {} }; // 未启用时 ready 永不 settle
-  if (cfg.INPUT_BUTTON === 'gamepad') {
-    // 手柄事件（录音在 py 层；INPUT_AUDIO=mic 时录音由 py 采集）
+  if (cfg.INPUT_AUDIO === 'gamepad') {
+    // gamepad.py 套件：手柄 A/B 键 + 麦克风录音（原先那套）
     gamepad = startGamepad(
       {
-        onTalkDown: () => console.log('[ptt] 录音中（a键）'),
+        onTalkDown: () => out.log('[ptt] 录音中（a键）'),
         onTalkUp,
-        onCmdDown: () => console.log('[ptt] 录音中（b键）'),
+        onCmdDown: () => out.log('[ptt] 录音中（b键）'),
         onCmdUp,
         onError: (msg) => logger.error?.(`[ptt] ${msg}`),
       },
       cfg,
       logger,
     );
-  } else {
-    console.log(`[ptt] 🔘 INPUT_BUTTON=${cfg.INPUT_BUTTON}：不启动手柄`);
+  } else if (cfg.INPUT_AUDIO === 'mic') {
+    out.log('[ptt] 🎙️ INPUT_AUDIO=mic：纯麦克风（暂无触发方式，待 VAD）');
+  } else if (cfg.INPUT_AUDIO !== 'ws') {
+    out.log(`[ptt] 🎙️ INPUT_AUDIO=${cfg.INPUT_AUDIO}：无音频输入`);
   }
 
   // ws 通道（INPUT_AUDIO=ws 收 wav；文本输入始终支持；OUTPUT_AUDIO=ws 播报输出）
@@ -327,33 +368,64 @@ export async function apply(ctx, config) {
         onText: (text) => {
           // 以 / 开头 = 命令；否则 = 正常对话文本输入
           if (text.startsWith('/')) {
-            console.log(`[ptt] 🕸️ 命令: ${text}`);
+            out.log(`[ptt] 🕸️ 命令: ${text}`);
             runOnce(() => handleCommand(text.slice(1)));
           } else {
-            handleTextInput(text);
+            runOnce(() => handleTextInput(text));
           }
         },
         onWav: (wav) => {
           // 音频输入：wav → ASR → 正常对话
           if (cfg.INPUT_AUDIO === 'ws') {
-            handleWavInput(wav);
+            runOnce(() => handleWavInput(wav));
           } else {
-            console.log(`[ptt] 🕸️ 收到 wav 但 INPUT_AUDIO=${cfg.INPUT_AUDIO}，忽略`);
+            out.log(`[ptt] 🕸️ 收到 wav 但 INPUT_AUDIO=${cfg.INPUT_AUDIO}，忽略`);
           }
         },
-        onSpeak: (text) => console.log(`[ptt] 🕸️ 播报→ws: ${text}`),
+        onSpeak: (text) => out.log(`[ptt] 🕸️ 播报→ws: ${text}`),
       },
       cfg.WS_URL,
       logger,
     );
   }
 
-  // ── 输出装配：speaker（say）默认；OUTPUT_AUDIO=ws 时播报转发到 ws ──
+  // ── 文本输入装配：INPUT_TEXT=stdin 读一行（回车提交）──
+  let stdinRl = null;
+  if (cfg.INPUT_TEXT === 'stdin') {
+    stdinRl = readline.createInterface({ input: process.stdin });
+    stdinRl.on('line', (line) => {
+      const text = line.trim();
+      if (!text) return;
+      out.log(`[ptt] ⌨️ stdin: ${text}`);
+      if (text.startsWith('/')) {
+        runOnce(() => handleCommand(text.slice(1)));
+      } else {
+        runOnce(() => handleTextInput(text));
+      }
+    });
+    out.log('[ptt] ⌨️ 文本输入: stdin（回车提交一行；/ 开头=命令）');
+  } else if (cfg.INPUT_TEXT === 'ws') {
+    out.log('[ptt] ⌨️ 文本输入: ws（ws 文本消息）');
+  } else {
+    out.log(`[ptt] ⌨️ 文本输入: ${cfg.INPUT_TEXT}（无文本输入）`);
+  }
+
+  // ── 输出装配：OUTPUT_AUDIO=say 本地 say；=ws 生成 wav 经 ws 广播；=none 静默 ──
   const origSay = speaker.say.bind(speaker);
-  if (cfg.OUTPUT_AUDIO === 'ws') {
+  if (cfg.OUTPUT_AUDIO === 'none') {
+    speaker.say = () => {}; // 无语音输出
+  } else if (cfg.OUTPUT_AUDIO === 'ws') {
     speaker.say = (text) => {
-      wsChannel.broadcastSpeak(text);
-      // ws 模式不本地 say
+      // say -o 生成 wav → base64 广播给 ws 客户端（由客户端播报）
+      const wavPath = `/tmp/dsh_ptt_say_${Date.now()}.wav`;
+      const p = spawn('say', ['-v', cfg.VOICE_NAME, '-o', wavPath, '--data-format=LEI16@16000', text], { stdio: 'ignore' });
+      p.on('exit', () => {
+        try {
+          const buf = fs.readFileSync(wavPath);
+          wsChannel.broadcastAudio(buf); // 二进制 wav 直发
+          fs.rmSync(wavPath, { force: true });
+        } catch { /* 生成失败忽略 */ }
+      });
     };
   } else {
     speaker.say = origSay;
@@ -362,14 +434,15 @@ export async function apply(ctx, config) {
   // 生命周期：退出时清理
   ctx.effect(() => {
     gamepad.ready.catch((err) => {
-      console.error(`[ptt] ❌ ${err?.message ?? err}`);
+      out.error(`[ptt] ❌ ${err?.message ?? err}`);
     });
     return () => {
       gamepad.dispose();
       wsChannel.dispose();
+      stdinRl?.close();
     };
   });
 
-  console.log('[ptt] 对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）');
-  console.log(`[ptt] 输入: 按钮=${cfg.INPUT_BUTTON} 音频=${cfg.INPUT_AUDIO} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
+  out.log('[ptt] 对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）');
+  out.log(`[ptt] 输入: 音频=${cfg.INPUT_AUDIO} 文本=${cfg.INPUT_TEXT} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
 }
