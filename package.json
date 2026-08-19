@@ -1,6 +1,6 @@
 {
   "name": "dsh-ptt",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "极简对讲机插件：手柄A键按住说话(ASR->DSH会话)，B键语音命令(stop/reset/model/status/help/compact/goal)",
   "type": "module",
   "main": "./index.js",
