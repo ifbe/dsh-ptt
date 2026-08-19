@@ -3,7 +3,7 @@
 //
 // 所有配置来自 profile 的 cordis.patch.yml（ptt 行的 config 段）——
 // 那是本插件的唯一配置文件，只影响 ptt profile，不影响其他 profile。
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import readline from 'node:readline';
 import { startGamepad } from './gamepad.js';
@@ -143,7 +143,7 @@ export async function apply(ctx, config) {
     PTT_INPUT_TEXT: 'stdin',       // 文本输入：stdin(回车一行) | ws | none
     PTT_INPUT_AUDIO: 'gamepad',    // 音频输入：gamepad(手柄+录音,gamepad.py) | mic(纯麦克风) | ws | none
     PTT_OUTPUT_TEXT: 'stdout',     // 文本输出：stdout(终端) | ws | none
-    PTT_OUTPUT_AUDIO: 'say',       // 语音输出：say(macOS) | ws | none
+    PTT_OUTPUT_AUDIO: 'auto',      // 语音输出：say(macOS) | ws | none；auto=自动检测（macOS+有say才say，否则none）
     PTT_MODEL: '',                 // LLM 模型 provider/model（如 omlx/Qwen3.6-35B-A3B-4bit），空=用配置
     PTT_WS_URL: '',                // ws 输入/输出地址（PTT_INPUT_AUDIO=ws 或 PTT_OUTPUT_AUDIO=ws 时必填）
     PTT_TTS: 'say',                // 语音合成：say(macOS) | none
@@ -165,6 +165,15 @@ export async function apply(ctx, config) {
   env.PTT_ASR_URL ||= cfg.OMLX_BASE_URL ?? '';
   env.PTT_ASR_KEY ||= cfg.OMLX_API_KEY ?? '';
   env.PTT_ASR_MODEL ||= cfg.ASR_MODEL ?? '';
+  // PTT_OUTPUT_AUDIO=auto：检测 macOS + say 命令，没有则 none（树莓派等 Linux 无 say）
+  if (env.PTT_OUTPUT_AUDIO === 'auto') {
+    let hasSay = false;
+    try {
+      execFileSync('which', ['say'], { stdio: 'ignore' });
+      hasSay = process.platform === 'darwin';
+    } catch { /* 无 say */ }
+    env.PTT_OUTPUT_AUDIO = hasSay ? 'say' : 'none';
+  }
   // PTT_MODEL=provider/model → 覆盖 LLM 配置
   if (env.PTT_MODEL) {
     const slash = env.PTT_MODEL.indexOf('/');
