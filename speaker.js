@@ -33,6 +33,7 @@ export class Speaker {
     this.onReply = onReply;
     this.out = out;
     this.pending = ''; // 正常回复（播报用）
+    this.pendingReasoning = ''; // think 内容（ws 文本输出用）
     this.sayQueue = []; // say 输出队列（串行播放，不并发不丢弃）
     this.playing = false;
   }
@@ -120,6 +121,7 @@ export class Speaker {
       // （切换打印统一在 handleEvent 入口处理）
       if (chunk?.type === 'reasoning-delta' && chunk.text) {
         // think：💭 emoji 开头（块内只一次）+ 灰色内容（不进入播报）
+        this.pendingReasoning += chunk.text;
         if (this.config.OUTPUT_TEXT !== 'none') {
           if (!this.inReasoning) {
             this._write(`${ANSI_GRAY}💭 `);
@@ -141,13 +143,16 @@ export class Speaker {
     }
     if (evt.type === 'turn/end') {
       const text = this.pending.trim();
+      const thinkText = this.pendingReasoning.trim();
       this.pending = '';
+      this.pendingReasoning = '';
       this.inReasoning = false;
       if (this.config.OUTPUT_TEXT !== 'none' && text) {
         this._write('\n\n'); // 回复后两个回车：文本换行 + 空行
       }
-      if (text) {
-        this.onReply?.(text); // 文本输出回调（ws 广播等，永远完整不截断）
+      if (text || thinkText) {
+        // 文本输出回调：think 与 reply 分开传（ws 广播可标不同标签）
+        this.onReply?.({ think: thinkText, reply: text });
         if (this.config.OUTPUT_AUDIO === 'ws') {
           // ws 输出：完整播报，不截断（客户端自己处理）
           this.say(text);

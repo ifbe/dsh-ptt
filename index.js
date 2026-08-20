@@ -9,6 +9,9 @@ import readline from 'node:readline';
 import { startGamepad } from './gamepad.js';
 import { startWs } from './ws.js';
 import { createOutputQueue } from './out.js';
+
+// 全局 stdout 队列（模块级：apply 内外的函数共用，防交错）
+const out = createOutputQueue();
 import { transcribe } from './asr.js';
 import { SessionBridge, manageSessions } from './session.js';
 import { Speaker } from './speaker.js';
@@ -47,7 +50,7 @@ const DEFAULTS = {
 };
 
 /** 列出 DSH 注册的所有 provider 及其可用模型（ctx.llm 标准机制） */
-async function showModels(ctx, speaker) {
+async function showModels(ctx, speaker, wsText) {
   try {
     const providers = ctx.llm.listProviders(); // [{id, name}]
     const lines = [];
@@ -62,23 +65,26 @@ async function showModels(ctx, speaker) {
     }
     out.log('[ptt] 📋 当前可用模型:');
     for (const l of lines) out.log('   ' + l);
+    wsText?.(`可用模型：\n${lines.join('\n')}`);
     speaker.say(`共有 ${providers.length} 个模型提供方`);
   } catch (err) {
     out.error(`[ptt] ❌ 查询模型失败: ${err?.message ?? err}`);
+    wsText?.(`查询模型失败：${err?.message ?? err}`);
     speaker.say('查询模型失败');
   }
 }
 
 /** 状态命令：显示当前会话信息 */
-async function showStatus(bridge, speaker) {
+async function showStatus(bridge, speaker, wsText) {
   const st = bridge.getStatus();
   const modeLabel = st.mode === 'assist' ? '辅助(聊天软件会话)' : '独立(ptt会话)';
   out.log(`[ptt] 📊 状态: 模式=${modeLabel} 会话=${st.sessionId ?? '无'} 模型=${st.model ?? '无'} 活跃=${st.active}`);
+  wsText?.(`状态：模式=${modeLabel} 会话=${st.sessionId ?? '无'} 模型=${st.model ?? '无'} 活跃=${st.active}`);
   speaker.say(`当前模式 ${modeLabel}，会话 ${st.sessionId ?? '无'}`);
 }
 
 /** 帮助命令：列出所有语音命令 */
-async function showHelp(speaker) {
+async function showHelp(speaker, wsText) {
   const cmds = [
     '停止：中断当前回复',
     '重置：清空上下文开新会话',
@@ -90,11 +96,12 @@ async function showHelp(speaker) {
   ];
   out.log('[ptt] 📖 语音命令:');
   for (const c of cmds) out.log('   ' + c);
+  wsText?.(`语音命令：\n${cmds.join('\n')}`);
   speaker.say('可用命令：停止、重置、模型、压缩、目标、状态、帮助');
 }
 
 /** 执行 DSH 原生命令（compact/goal），打印并播报结果 */
-async function runDshCommand(ctx, bridge, line, speaker) {
+async function runDshCommand(ctx, bridge, line, speaker, wsText) {
   try {
     const rec = await bridge.ensure();
     if (!rec) {
@@ -112,6 +119,7 @@ async function runDshCommand(ctx, bridge, line, speaker) {
     }
     const text = result.result?.text ?? JSON.stringify(result.result);
     out.log(`[ptt] 💬 ${line}: ${text}`);
+    wsText?.(`${line} ${text}`);
     speaker.say(text.slice(0, 80));
   } catch (err) {
     out.error(`[ptt] ❌ 命令执行失败: ${err?.message ?? err}`);
@@ -136,7 +144,6 @@ export async function apply(ctx, config) {
   const agents = ctx.agents;
   const logger = ctx.logger ?? console;
   const cfg = { ...DEFAULTS, ...(config ?? {}) };
-  const out = createOutputQueue(); // 全局 stdout 队列（输入/输出共用，防交错）
 
   // ── 环境变量（PTT_ 前缀防冲突，export 提供；未设则用默认）──
   const ENV_DEFAULTS = {
@@ -213,9 +220,12 @@ export async function apply(ctx, config) {
 
   // ── 启动时会话管理：打印全部会话 → 排序打印 → 模式分支 ──
   const bridge = new SessionBridge(agents, cfg, ctx.llm, ctx);
-  const speaker = new Speaker(cfg, (replyText) => {
-    // 文本输出回调（turn/end 时）：OUTPUT_TEXT=ws → 广播；none → 不处理
-    if (cfg.OUTPUT_TEXT === 'ws') wsChannel.broadcastText(replyText);
+  const speaker = new Speaker(cfg, ({ think, reply }) => {
+    // 文本输出回调（turn/end 时）：OUTPUT_TEXT=ws → 广播（think/reply 标不同标签）
+    if (cfg.OUTPUT_TEXT === 'ws') {
+      if (think) wsChannel.broadcastText(think, 'think');
+      if (reply) wsChannel.broadcastText(reply, 'reply');
+    }
   }, out);
   const { mode } = await manageSessions(ctx, bridge);
 
@@ -282,14 +292,18 @@ export async function apply(ctx, config) {
   // 通用：执行语音/文本命令（B键 / ws /命令）
   const handleCommand = async (text) => {
     const cmd = matchCommand(text, cfg);
+    // 命令反馈：OUTPUT_TEXT=ws 时也广播文本（网页可看到命令结果）
+    const wsText = (t) => {
+      if (cfg.OUTPUT_TEXT === 'ws') wsChannel.broadcastText(t, 'reply');
+    };
     if (cmd === 'model') {
-      await showModels(ctx, speaker);
+      await showModels(ctx, speaker, wsText);
     } else if (cmd === 'status') {
-      await showStatus(bridge, speaker);
+      await showStatus(bridge, speaker, wsText);
     } else if (cmd === 'help') {
-      await showHelp(speaker);
+      await showHelp(speaker, wsText);
     } else if (cmd === 'compact' || cmd === 'goal') {
-      await runDshCommand(ctx, bridge, cmd === 'compact' ? '/compact' : '/goal', speaker);
+      await runDshCommand(ctx, bridge, cmd === 'compact' ? '/compact' : '/goal', speaker, wsText);
     } else if (cmd === 'stop') {
       if (bridge.stop()) {
         out.log('[ptt] ⏹️ 已发送停止');
