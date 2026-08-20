@@ -66,12 +66,12 @@ export function startWs({ onText, onWav, onSpeak }, url, logger = console) {
   // 同一端口：http 服务测试网页 + ws（WebSocket 握手走 Upgrade，互不冲突）
   const server = http.createServer((req, res) => {
     // 根路径 / 也返回测试网页（直接访问 http://host:port 即可）
-    const pathname = req.url === '/' ? '/test.html' : req.url;
-    if (pathname === '/' || pathname === '/test.html') {
-      fs.readFile(path.join(HERE, 'test.html'), (err, data) => {
+    const pathname = req.url === '/' ? '/index.html' : req.url;
+    if (pathname === '/' || pathname === '/index.html') {
+      fs.readFile(path.join(HERE, 'index.html'), (err, data) => {
         if (err) {
           res.writeHead(404);
-          res.end('test.html not found');
+          res.end('index.html not found');
           return;
         }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

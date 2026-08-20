@@ -65,8 +65,9 @@ async function showModels(ctx, speaker, wsText) {
     }
     out.log('[ptt] 📋 当前可用模型:');
     for (const l of lines) out.log('   ' + l);
-    wsText?.(`可用模型：\n${lines.join('\n')}`);
-    speaker.say(`共有 ${providers.length} 个模型提供方`);
+    const modelText = `可用模型：\n${lines.join('\n')}`;
+    wsText?.(modelText);
+    speaker.say(modelText);
   } catch (err) {
     out.error(`[ptt] ❌ 查询模型失败: ${err?.message ?? err}`);
     wsText?.(`查询模型失败：${err?.message ?? err}`);
@@ -79,8 +80,9 @@ async function showStatus(bridge, speaker, wsText) {
   const st = bridge.getStatus();
   const modeLabel = st.mode === 'assist' ? '辅助(聊天软件会话)' : '独立(ptt会话)';
   out.log(`[ptt] 📊 状态: 模式=${modeLabel} 会话=${st.sessionId ?? '无'} 模型=${st.model ?? '无'} 活跃=${st.active}`);
-  wsText?.(`状态：模式=${modeLabel} 会话=${st.sessionId ?? '无'} 模型=${st.model ?? '无'} 活跃=${st.active}`);
-  speaker.say(`当前模式 ${modeLabel}，会话 ${st.sessionId ?? '无'}`);
+  const statusText = `状态：模式=${modeLabel} 会话=${st.sessionId ?? '无'} 模型=${st.model ?? '无'} 活跃=${st.active}`;
+  wsText?.(statusText);
+  speaker.say(statusText);
 }
 
 /** 帮助命令：列出所有语音命令 */
@@ -96,8 +98,9 @@ async function showHelp(speaker, wsText) {
   ];
   out.log('[ptt] 📖 语音命令:');
   for (const c of cmds) out.log('   ' + c);
-  wsText?.(`语音命令：\n${cmds.join('\n')}`);
-  speaker.say('可用命令：停止、重置、模型、压缩、目标、状态、帮助');
+  const helpText = `语音命令：\n${cmds.join('\n')}`;
+  wsText?.(helpText);
+  speaker.say(helpText);
 }
 
 /** 执行 DSH 原生命令（compact/goal），打印并播报结果 */
@@ -119,8 +122,9 @@ async function runDshCommand(ctx, bridge, line, speaker, wsText) {
     }
     const text = result.result?.text ?? JSON.stringify(result.result);
     out.log(`[ptt] 💬 ${line}: ${text}`);
-    wsText?.(`${line} ${text}`);
-    speaker.say(text.slice(0, 80));
+    const cmdText = `${line} ${text}`;
+    wsText?.(cmdText);
+    speaker.say(cmdText);
   } catch (err) {
     out.error(`[ptt] ❌ 命令执行失败: ${err?.message ?? err}`);
     speaker.say('命令执行失败');
@@ -307,17 +311,21 @@ export async function apply(ctx, config) {
     } else if (cmd === 'stop') {
       if (bridge.stop()) {
         out.log('[ptt] ⏹️ 已发送停止');
+        wsText?.('已停止');
         speaker.say('已停止');
       } else {
         out.log('[ptt] ⚠️ 无会话可停止');
-        speaker.say('会话不存在');
+        wsText?.('无会话可停止');
+        speaker.say('无会话可停止');
       }
     } else if (cmd === 'reset') {
       if (await bridge.reset()) {
         out.log('[ptt] 🔄 会话已重置（上下文清空）');
-        speaker.say('会话已重置');
+        wsText?.('会话已重置（上下文清空）');
+        speaker.say('会话已重置（上下文清空）');
       } else {
         out.log('[ptt] ⚠️ 无法重置（辅助模式不重置聊天会话，或无会话）');
+        wsText?.('无法重置（辅助模式不重置聊天会话，或无会话）');
         speaker.say('无法重置');
       }
     } else {
