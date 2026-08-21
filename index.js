@@ -57,7 +57,12 @@ async function showModels(ctx, speaker, wsText) {
     for (const p of providers) {
       try {
         const models = await ctx.llm.listModels(p.id);
-        const ids = models.map((m) => m.id).join(', ');
+        // 模型名后标注能力（inputModalities：text/image/audio）
+        const ids = models.map((m) => {
+          const mods = m.inputModalities ?? [];
+          const caps = mods.length ? ` (${mods.join('/')})` : '';
+          return `${m.id}${caps}`;
+        }).join(', ');
         lines.push(`${p.name ?? p.id}: ${ids || '(空)'}`);
       } catch {
         lines.push(`${p.name ?? p.id}: (模型列表不可用)`);
