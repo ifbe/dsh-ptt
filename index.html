@@ -47,6 +47,9 @@
   .thumb { position: relative; }
   .thumb img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; border: 1px solid #ccc; display: block; }
   .thumb .rm { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; padding: 0; font-size: 12px; line-height: 1; border-radius: 50%; background: #f44336; color: #fff; border: 1px solid #fff; }
+  .wavchip { position: relative; display: flex; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; background: #eef2ff; font-size: 12px; color: #333; max-width: 200px; }
+  .wavchip .nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wavchip .rm { flex: none; width: 18px; height: 18px; padding: 0; font-size: 12px; line-height: 1; border-radius: 50%; background: #f44336; color: #fff; border: 1px solid #fff; }
 </style>
 </head>
 <body>
@@ -68,13 +71,14 @@
       <button onclick="sendCmd()">发送命令</button>
     </div>
   </div>
-  <input type="file" id="imgFiles" accept="image/*" multiple style="display:none">
+  <input type="file" id="imgFiles" accept="image/*,.wav,audio/wav" multiple style="display:none">
 
 </div>
 
 <script>
 let ws = null;
 let images = []; // [{data(base64), mediaType, name}] 待发送图片
+let wavs = [];   // [{data(ArrayBuffer), name, size}] 待发送 wav
 
 const $ = (id) => document.getElementById(id);
 const chat = $('chat');
@@ -175,7 +179,7 @@ $('btnToggle').onclick = () => {
   else { connect(); }
 };
 
-// ── 图片：选择 / 拖拽 → 缩略图 → 随文字一起发送 ──
+// ── 附件：选择 / 拖拽 → 图片缩略图 + wav 标记 → 随发送一起送出 ──
 function pickFiles() { $('imgFiles').click(); }
 
 function fileToImage(file) {
@@ -190,13 +194,25 @@ function fileToImage(file) {
   });
 }
 
+function isWav(file) {
+  return file.type === 'audio/wav' || file.type === 'audio/x-wav' || file.type === 'audio/wave' || /\.wav$/i.test(file.name);
+}
+
 async function addFiles(files) {
   for (const file of files) {
-    if (!file.type || !file.type.startsWith('image/')) { addNote('跳过非图片: ' + file.name); continue; }
-    try {
-      const img = await fileToImage(file);
-      images.push(img);
-    } catch (err) { addNote('读取图片失败: ' + file.name); }
+    if (isWav(file)) {
+      try {
+        const buf = await file.arrayBuffer();
+        wavs.push({ data: buf, name: file.name, size: buf.byteLength });
+      } catch (err) { addNote('读取 wav 失败: ' + file.name); }
+    } else if (!file.type || file.type.startsWith('image/')) {
+      try {
+        const img = await fileToImage(file);
+        images.push(img);
+      } catch (err) { addNote('读取图片失败: ' + file.name); }
+    } else {
+      addNote('跳过不支持的类型: ' + file.name);
+    }
   }
   renderThumbs();
 }
@@ -215,6 +231,20 @@ function renderThumbs() {
     t.appendChild(im);
     t.appendChild(rm);
     thumbs.appendChild(t);
+  });
+  wavs.forEach((w, i) => {
+    const c = document.createElement('div');
+    c.className = 'wavchip';
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = '🎵 ' + w.name + '（' + (w.size/1024).toFixed(1) + 'KB）';
+    const rm = document.createElement('button');
+    rm.className = 'rm';
+    rm.textContent = '×';
+    rm.onclick = () => { wavs.splice(i, 1); renderThumbs(); };
+    c.appendChild(nm);
+    c.appendChild(rm);
+    thumbs.appendChild(c);
   });
 }
 
@@ -246,21 +276,26 @@ document.addEventListener('drop', (e) => {
 function sendText() {
   const text = $('chatInput').value.trim();
   if (!ws || ws.readyState !== WebSocket.OPEN) return alert('未连接');
-  // 无图片：保持原逻辑（纯文本）
-  if (images.length === 0) {
-    if (!text) return;
+  let sent = false;
+  // 1) wav（音频）→ 二进制逐帧发（后端 onWav → ASR → 模型）
+  for (const w of wavs) { ws.send(w.data); sent = true; }
+  wavs = [];
+  // 2) 图片（可带文字）→ JSON 信封
+  if (images.length) {
+    const payload = { type: 'user', text, images: images.map((img) => ({ mediaType: img.mediaType, data: img.data })) };
+    ws.send(JSON.stringify(payload));
+    if (text) addBubble('b-self', text);
+    addImageBubble(images);
+    $('chatInput').value = '';
+    images = [];
+    sent = true;
+  } else if (text) {
+    // 3) 纯文字
     ws.send(text);
     addBubble('b-self', text);
     $('chatInput').value = '';
-    return;
+    sent = true;
   }
-  // 有图片：发 JSON 信封（text + images 一起），text 可为空
-  const payload = { type: 'user', text, images: images.map((img) => ({ mediaType: img.mediaType, data: img.data })) };
-  ws.send(JSON.stringify(payload));
-  if (text) addBubble('b-self', text);
-  addImageBubble(images);
-  $('chatInput').value = '';
-  images = [];
   renderThumbs();
 }
 // 发送命令：自动加 /
