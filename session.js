@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { createUserMessage, contentHasImage } from '@deepseek-ai/dsh-llm';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 状态文件：profile 目录（dsh-ptt 的上级）
@@ -376,6 +376,108 @@ export class SessionBridge {
       }),
     );
     return { ok: true };
+  }
+
+  /**
+   * 通用：发送一组内容块（text/image 等）给模型。
+   * 图片块需已用附件服务保存为 ImageAttachmentRef。
+   * 返回 {ok:true} 已发送；{noSession:true} 无会话。
+   */
+  async talkUserContent(blocks) {
+    const rec = await this.ensure();
+    if (!rec) return { noSession: true };
+    rec.agent.followup(
+      createUserMessage({
+        content: blocks,
+        source: { kind: 'user' },
+      }),
+    );
+    return { ok: true };
+  }
+
+  /**
+   * 切换当前会话的模型（provider/model）。校验通过后用一个新 agent 重新
+   * 挂到同一会话（agentOptions 覆盖模型），并让后续 ensure/resume 沿用。
+   * 返回 {ok:true, model}；{noSession:true}；{fail:原因}；校验失败 throw。
+   */
+  async switchModel(provider, model) {
+    if (this.isAssist) return { fail: '辅助模式（聊天软件会话）不由 ptt 切换模型' };
+    // 校验 route（未知 provider/model 会抛错）→ 给调用方做失败处理
+    const resolved = await this.llm.resolveCallConfig({ provider, model });
+    const rec = await this.ensure();
+    if (!rec) return { noSession: true };
+    // 回合进行中不切换（对齐 tui：/model 在 working 时被拒）
+    if (rec.agent?.status === 'running') {
+      return { fail: '当前回合进行中，先停止/等完成再切换模型' };
+    }
+    // 会话已含图片时，要求新模型支持 image
+    const msgs = rec.agent?.session?.deriveMessages?.() ?? [];
+    if (msgs.some((m) => contentHasImage(m.content))) {
+      const info = typeof this.llm.resolveModelInfo === 'function'
+        ? await this.llm.resolveModelInfo(resolved.provider, resolved.model)
+        : undefined;
+      if (info?.inputModalities && !info.inputModalities.includes('image')) {
+        return { fail: `当前会话已含图片，但 ${resolved.model} 不支持 image` };
+      }
+    }
+    // 用新模型重新挂到同一会话（保留历史），替换当前 agent 句柄
+    const sessionId = this.sessionId;
+    if (this.record) await this.record.dispose().catch(() => {});
+    const resumed = await this.agents.resume({
+      resumeSessionId: sessionId,
+      agentOptions: { provider: resolved.provider, model: resolved.model },
+    });
+    this.record = resumed;
+    // 让后续 ensure()/agentOptions() 也沿用新模型
+    this.config.LLM_PROVIDER = resolved.provider;
+    this.config.LLM_MODEL = resolved.model;
+    return { ok: true, model: `${resolved.provider}/${resolved.model}` };
+  }
+
+  /**
+   * 切换当前会话的工作目录（cwd）。会话的 cwd 写在不可变的 header 里、
+   * resume 也沿用原 cwd，所以只能 fork 会话（保留历史）+ 新 cwd 重建 agent。
+   * 返回 {ok:true, cwd}；{noSession:true}；{fail:原因}；路径校验失败也走 fail。
+   */
+  async switchWorkspace(path) {
+    if (this.isAssist) return { fail: '辅助模式（聊天软件会话）不由 ptt 切换工作目录' };
+    // 校验目录存在且是目录
+    let stat;
+    try {
+      stat = fs.statSync(path);
+    } catch {
+      return { fail: `路径不存在或不可访问: ${path}` };
+    }
+    if (!stat.isDirectory()) return { fail: `路径不是目录: ${path}` };
+    const rec = await this.ensure();
+    if (!rec) return { noSession: true };
+    if (rec.agent?.status === 'running') return { fail: '当前回合进行中，先停止/等完成再切换' };
+    const sessions = this.ctx.get('sessions');
+    if (!sessions) return { fail: '会话服务不可用' };
+    // fork 当前会话 → 提取事件当 seed（保留历史）
+    let seed;
+    try {
+      seed = sessions.fork(rec.agent.session).events;
+    } catch (err) {
+      return { fail: `会话 fork 失败: ${err?.message ?? err}` };
+    }
+    const before = rec.agent.session.header.cwd ?? process.cwd();
+    const newId = randomUUID();
+    if (this.record) await this.record.dispose().catch(() => {});
+    const record = await this.agents.create({
+      sessionId: newId,
+      seed,
+      meta: {
+        cwd: path,
+        parentSession: rec.agent.session.id,
+        seedLength: seed.length,
+      },
+      agentOptions: this.agentOptions(),
+    });
+    this.record = record;
+    this.sessionId = newId;
+    this.writeStateId(newId);
+    return { ok: true, cwd: path, before };
   }
 
   /** B键语音命令 → 中断当前回复 */

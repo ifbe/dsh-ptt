@@ -15,6 +15,7 @@
   }
   /* 上：聊天区（占剩余空间，可滚动） */
   #chat { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 12px; background: #f0f2f5; }
+  #chat.dragover { outline: 3px dashed #4fc3f7; outline-offset: -6px; }
   .bubble { max-width: 70%; padding: 8px 12px; border-radius: 12px; margin: 6px 0; word-wrap: break-word; font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
   .b-think  { background: #e8e8e8; color: #777; font-style: italic; border-top-left-radius: 2px; }
   .b-reply  { background: #4fc3f7; color: #fff; border-top-left-radius: 2px; }
@@ -23,6 +24,8 @@
   .b-audio  { background: #fff; border: 1px solid #0288d1; border-radius: 8px; padding: 6px; }
   .b-audio audio { width: 100%; display: block; }
   .b-audio .lbl { font-size: 12px; color: #0288d1; margin-bottom: 4px; }
+  .b-img { display: flex; flex-wrap: wrap; gap: 6px; }
+  .b-img img { max-width: 120px; max-height: 120px; border-radius: 6px; }
   .note { font-size: 12px; color: #999; margin: 3px 0; text-align: center; }
 
   /* 下：控件区（结尾在 100%，起点按内容自适应；内容多时内部滚动） */
@@ -37,6 +40,13 @@
   #status { font-size: 12px; color: #666; }
   .conn { color: #4caf50; }
   .disconn { color: #f44336; }
+
+  /* 缩略图区：文本框上方，无图时隐藏 */
+  #thumbs { display: flex; flex-wrap: wrap; gap: 6px; }
+  #thumbs:empty { display: none; }
+  .thumb { position: relative; }
+  .thumb img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; border: 1px solid #ccc; display: block; }
+  .thumb .rm { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; padding: 0; font-size: 12px; line-height: 1; border-radius: 50%; background: #f44336; color: #fff; border: 1px solid #fff; }
 </style>
 </head>
 <body>
@@ -46,25 +56,29 @@
     <input id="wsUrl">
     <button id="btnToggle">未连接，点我连接</button>
   </div>
+  <div id="thumbs"></div>
   <div class="row" style="align-items: stretch;">
+    <div style="display:flex;flex-direction:column;gap:6px;flex:none;">
+      <button onclick="pickFiles()">选择文件</button>
+      <button onclick="clearChat()">清空对话</button>
+    </div>
     <textarea id="chatInput" rows="3" placeholder="文本消息（回车=换行）&#10;/help /status /model /stop /reset /compact"></textarea>
     <div style="display:flex;flex-direction:column;gap:6px;flex:none;">
       <button onclick="sendText()">发送文字</button>
       <button onclick="sendCmd()">发送命令</button>
-      <button onclick="clearChat()">清空</button>
     </div>
   </div>
-  <div class="row">
-    <input type="file" id="wavFile" accept=".wav,audio/wav">
-  </div>
+  <input type="file" id="imgFiles" accept="image/*" multiple style="display:none">
 
 </div>
 
 <script>
 let ws = null;
+let images = []; // [{data(base64), mediaType, name}] 待发送图片
 
 const $ = (id) => document.getElementById(id);
 const chat = $('chat');
+const thumbs = $('thumbs');
 
 // ws 地址默认 = 当前页面 URL（同 host:port）
 $('wsUrl').value = 'ws://' + location.host;
@@ -88,6 +102,21 @@ function addAudioBubble(bytes) {
   audio.src = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
   div.appendChild(lbl);
   div.appendChild(audio);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+function addImageBubble(imgs) {
+  const div = document.createElement('div');
+  div.className = 'bubble b-self';
+  const wrap = document.createElement('div');
+  wrap.className = 'b-img';
+  for (const img of imgs) {
+    const im = document.createElement('img');
+    im.src = 'data:' + img.mediaType + ';base64,' + img.data;
+    wrap.appendChild(im);
+  }
+  div.appendChild(wrap);
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
@@ -146,13 +175,93 @@ $('btnToggle').onclick = () => {
   else { connect(); }
 };
 
+// ── 图片：选择 / 拖拽 → 缩略图 → 随文字一起发送 ──
+function pickFiles() { $('imgFiles').click(); }
+
+function fileToImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result; // data:image/png;base64,....
+      resolve({ data: dataUrl.split(',')[1], mediaType: file.type || 'image/png', name: file.name });
+    };
+    reader.onerror = () => reject(new Error('读取失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addFiles(files) {
+  for (const file of files) {
+    if (!file.type || !file.type.startsWith('image/')) { addNote('跳过非图片: ' + file.name); continue; }
+    try {
+      const img = await fileToImage(file);
+      images.push(img);
+    } catch (err) { addNote('读取图片失败: ' + file.name); }
+  }
+  renderThumbs();
+}
+
+function renderThumbs() {
+  thumbs.innerHTML = '';
+  images.forEach((img, i) => {
+    const t = document.createElement('div');
+    t.className = 'thumb';
+    const im = document.createElement('img');
+    im.src = 'data:' + img.mediaType + ';base64,' + img.data;
+    const rm = document.createElement('button');
+    rm.className = 'rm';
+    rm.textContent = '×';
+    rm.onclick = () => { images.splice(i, 1); renderThumbs(); };
+    t.appendChild(im);
+    t.appendChild(rm);
+    thumbs.appendChild(t);
+  });
+}
+
+$('imgFiles').addEventListener('change', (e) => {
+  addFiles(Array.from(e.target.files || []));
+  e.target.value = '';
+});
+
+// Ctrl+Enter（或 Cmd+Enter）发送：回车本身仍为换行
+$('chatInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault(); // 阻止插入换行
+    sendText();
+  }
+});
+
+// 拖拽：把图片文件拖进网页即加入缩略图
+let dragDepth = 0;
+document.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; chat.classList.add('dragover'); });
+document.addEventListener('dragover', (e) => { e.preventDefault(); });
+document.addEventListener('dragleave', (e) => { e.preventDefault(); dragDepth--; if (dragDepth <= 0) { dragDepth = 0; chat.classList.remove('dragover'); } });
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  chat.classList.remove('dragover');
+  addFiles(Array.from(e.dataTransfer?.files || []));
+});
+
 function sendText() {
   const text = $('chatInput').value.trim();
-  if (!text) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return alert('未连接');
-  ws.send(text);
-  addBubble('b-self', text);
+  // 无图片：保持原逻辑（纯文本）
+  if (images.length === 0) {
+    if (!text) return;
+    ws.send(text);
+    addBubble('b-self', text);
+    $('chatInput').value = '';
+    return;
+  }
+  // 有图片：发 JSON 信封（text + images 一起），text 可为空
+  const payload = { type: 'user', text, images: images.map((img) => ({ mediaType: img.mediaType, data: img.data })) };
+  ws.send(JSON.stringify(payload));
+  if (text) addBubble('b-self', text);
+  addImageBubble(images);
   $('chatInput').value = '';
+  images = [];
+  renderThumbs();
 }
 // 发送命令：自动加 /
 function sendCmd() {
@@ -167,18 +276,11 @@ function sendCmdText(cmd) {
   addBubble('b-self', cmd);
 }
 
-$('wavFile').addEventListener('change', (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return alert('未连接');
-  file.arrayBuffer().then((buf) => {
-    ws.send(buf);
-    addNote('已发送 wav ' + buf.byteLength + ' 字节（' + file.name + '）');
-  });
-  e.target.value = '';
-});
-
-function clearChat() { chat.innerHTML = ''; }
+function clearChat() {
+  chat.innerHTML = '';
+  images = [];
+  renderThumbs();
+}
 </script>
 </body>
 </html>

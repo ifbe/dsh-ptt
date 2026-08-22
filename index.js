@@ -40,6 +40,9 @@ const DEFAULTS = {
   STOP_KEYWORDS: ['stop', '停止', '别说了', '闭嘴', '停下'],
   RESET_KEYWORDS: ['reset', '重置', '清空', '重来', '新会话'],
   MODEL_KEYWORDS: ['model', '模型', '可用模型', '有哪些模型'],
+  PERMISSION_KEYWORDS: ['permission', '权限', '许可'],
+  FORK_KEYWORDS: ['fork', '工作目录', '路径'],
+  WORKSPACE_KEYWORDS: ['workspace'],
   STATUS_KEYWORDS: ['status', '状态', '当前状态'],
   HELP_KEYWORDS: ['help', '帮助', '有什么命令', '有哪些命令'],
   COMPACT_KEYWORDS: ['compact', '压缩', '压缩一下'],
@@ -49,34 +52,254 @@ const DEFAULTS = {
   ASR_DEBUG: false,
 };
 
-/** 列出 DSH 注册的所有 provider 及其可用模型（ctx.llm 标准机制） */
-async function showModels(ctx, speaker, wsText) {
+/** 解析 /cmd 文本里的参数（第一个 token 之后的部分） */
+function cmdArg(cmdText) {
+  return (cmdText ?? '').trim().split(/\s+/).slice(1).join(' ').trim();
+}
+
+/**
+ * /model 命令：
+ *   无参数 = 列出所有模型 + 标注当前模型（能力标签）
+ *   有参数 = 切换当前会话模型（provider/model），失败处理
+ */
+async function showModels(ctx, speaker, wsText, bridge, cmdText) {
+  const arg = cmdArg(cmdText);
+  if (arg) {
+    await switchModel(ctx, speaker, wsText, bridge, arg);
+    return;
+  }
   try {
+    let currentModel = '未知';
+    try {
+      const rec = await bridge.ensure();
+      currentModel = bridge.modelOf(rec?.agent);
+    } catch { /* 无会话 → 未知 */ }
     const providers = ctx.llm.listProviders(); // [{id, name}]
     const lines = [];
     for (const p of providers) {
       try {
         const models = await ctx.llm.listModels(p.id);
-        // 模型名后标注能力（inputModalities：text/image/audio）
+        // 模型名后标注能力（inputModalities：text/image/audio）+ 当前模型
         const ids = models.map((m) => {
           const mods = m.inputModalities ?? [];
           const caps = mods.length ? ` (${mods.join('/')})` : '';
-          return `${m.id}${caps}`;
+          const mark = `${p.id}/${m.id}` === currentModel ? ' ◀当前' : '';
+          return `${m.id}${caps}${mark}`;
         }).join(', ');
         lines.push(`${p.name ?? p.id}: ${ids || '(空)'}`);
       } catch {
         lines.push(`${p.name ?? p.id}: (模型列表不可用)`);
       }
     }
-    out.log('[ptt] 📋 当前可用模型:');
+    const head = `当前模型: ${currentModel}`;
+    out.log(`[ptt] 📋 ${head}`);
     for (const l of lines) out.log('   ' + l);
-    const modelText = `可用模型：\n${lines.join('\n')}`;
+    const modelText = `${head}\n${lines.join('\n')}\n\n用法: /model <provider/model> 切换会话模型`;
     wsText?.(modelText);
-    speaker.say(modelText);
+    speaker.say(`当前模型 ${currentModel}`);
   } catch (err) {
     out.error(`[ptt] ❌ 查询模型失败: ${err?.message ?? err}`);
     wsText?.(`查询模型失败：${err?.message ?? err}`);
     speaker.say('查询模型失败');
+  }
+}
+
+/** /model <provider/model>：切换当前会话模型（校验 + 失败处理） */
+async function switchModel(ctx, speaker, wsText, bridge, arg) {
+  const slash = arg.indexOf('/');
+  let provider = '', model = '';
+  if (slash > 0 && slash < arg.length - 1) {
+    provider = arg.slice(0, slash).trim();
+    model = arg.slice(slash + 1).trim();
+  }
+  if (!provider || !model) {
+    const msg = `格式应为 provider/model（如 omlx/Qwen3.6-35B-A3B-4bit）：${arg || '(空)'}`;
+    out.error(`[ptt] ❌ ${msg}`);
+    wsText?.(msg);
+    speaker.say('模型格式错误');
+    return;
+  }
+  try {
+    const r = await bridge.switchModel(provider, model);
+    if (r.noSession) {
+      const msg = '无会话，无法切换模型（请先在聊天软件发条消息）';
+      out.log(`[ptt] ⚠️ ${msg}`);
+      wsText?.(msg);
+      speaker.say('没有会话');
+      return;
+    }
+    if (r.fail) {
+      const msg = `切换失败: ${r.fail}`;
+      out.error(`[ptt] ❌ ${msg}`);
+      wsText?.(msg);
+      speaker.say('模型切换失败');
+      return;
+    }
+    const msg = `✅ 已切换到 ${r.model}`;
+    out.log(`[ptt] ${msg}`);
+    wsText?.(msg);
+    speaker.say(`已切换到 ${r.model}`);
+  } catch (err) {
+    const msg = `切换失败: ${err?.message ?? err}`;
+    out.error(`[ptt] ❌ ${msg}`);
+    wsText?.(msg);
+    speaker.say('模型切换失败');
+  }
+}
+
+/** /permission 命令：无参=列所有权限+当前；有参=切换 */
+async function showPermissions(ctx, speaker, wsText, bridge, cmdText) {
+  const arg = cmdArg(cmdText);
+  let pp;
+  try { pp = ctx.get('permissionPresets'); } catch {}
+  if (!pp) {
+    const msg = '权限系统不可用（未安装 permission 预设）';
+    out.error(`[ptt] ❌ ${msg}`);
+    wsText?.(msg);
+    speaker.say('权限不可用');
+    return;
+  }
+  // 无参数：列出所有权限 + 当前
+  if (!arg) {
+    try {
+      const rec = await bridge.ensure();
+      const events = rec?.agent?.session?.events;
+      const cur = pp.current?.(events) ?? 'unknown';
+      const lines = pp.names.map((n) => {
+        const o = pp.optionOf(n);
+        const label = o.name && o.name !== o.value ? `${o.value}（${o.name}）` : o.value;
+        return `· ${label}${o.description ? ` — ${o.description}` : ''}`;
+      });
+      const head = `当前权限: ${cur}（可用: ${pp.names.join(', ')}）`;
+      out.log(`[ptt] 📋 ${head}`);
+      for (const l of lines) out.log('   ' + l);
+      const text = `${head}\n${lines.join('\n')}\n\n用法: /permission <名称> 切换权限`;
+      wsText?.(text);
+      speaker.say(`当前权限 ${cur}`);
+    } catch (err) {
+      out.error(`[ptt] ❌ 权限列表失败: ${err?.message ?? err}`);
+      wsText?.(`权限列表失败：${err?.message ?? err}`);
+    }
+    return;
+  }
+  // 有参数：切换
+  try {
+    const rec = await bridge.ensure();
+    if (!rec?.agent) {
+      const msg = '无会话，无法切换权限';
+      out.log(`[ptt] ⚠️ ${msg}`);
+      wsText?.(msg);
+      speaker.say('没有会话');
+      return;
+    }
+    if (!pp.names.includes(arg)) {
+      const msg = `未知权限 "${arg}"（可用: ${pp.names.join(', ')}）`;
+      out.error(`[ptt] ❌ ${msg}`);
+      wsText?.(msg);
+      speaker.say('未知权限');
+      return;
+    }
+    pp.set(rec.agent.session, arg);
+    const msg = `✅ 已切换到权限 ${arg}`;
+    out.log(`[ptt] ${msg}`);
+    wsText?.(msg);
+    speaker.say(`已切换到权限 ${arg}`);
+  } catch (err) {
+    const msg = `切换失败: ${err?.message ?? err}`;
+    out.error(`[ptt] ❌ ${msg}`);
+    wsText?.(msg);
+    speaker.say('权限切换失败');
+  }
+}
+
+/** /workspace 命令：无参=显示当前工作目录；有参=切换到该目录（失败提示） */
+async function showWorkspace(ctx, speaker, wsText, bridge, cmdText) {
+  const arg = cmdArg(cmdText);
+  if (!arg) {
+    // 显示当前工作目录
+    try {
+      const rec = await bridge.ensure();
+      if (!rec) {
+        const msg = '无会话，无工作目录';
+        out.log(`[ptt] ⚠️ ${msg}`);
+        wsText?.(msg);
+        speaker.say('没有会话');
+        return;
+      }
+      const cwd = rec.agent?.session?.header?.cwd ?? process.cwd();
+      const msg = `当前工作目录: ${cwd}`;
+      out.log(`[ptt] 📁 ${msg}`);
+      wsText?.(msg);
+      speaker.say(`当前目录 ${cwd}`);
+    } catch (err) {
+      out.error(`[ptt] ❌ 读取目录失败: ${err?.message ?? err}`);
+      wsText?.(`读取目录失败：${err?.message ?? err}`);
+    }
+    return;
+  }
+  // 切换到指定目录
+  try {
+    const r = await bridge.switchWorkspace(arg);
+    if (r.noSession) {
+      const msg = '无会话，无法切换目录';
+      out.log(`[ptt] ⚠️ ${msg}`);
+      wsText?.(msg);
+      speaker.say('没有会话');
+      return;
+    }
+    if (r.fail) {
+      const msg = `切换失败: ${r.fail}`;
+      out.error(`[ptt] ❌ ${msg}`);
+      wsText?.(msg);
+      speaker.say('目录切换失败');
+      return;
+    }
+    const msg = `✅ 已切换到 ${r.cwd}`;
+    out.log(`[ptt] ${msg}`);
+    wsText?.(msg);
+    speaker.say(`已切换到 ${r.cwd}`);
+  } catch (err) {
+    const msg = `切换失败: ${err?.message ?? err}`;
+    out.error(`[ptt] ❌ ${msg}`);
+    wsText?.(msg);
+    speaker.say('目录切换失败');
+  }
+}
+
+/** /workspace（无参）→ 列出当前工作目录的内容 */
+async function showWorkspaceList(ctx, speaker, wsText, bridge) {
+  try {
+    const rec = await bridge.ensure();
+    if (!rec) {
+      const msg = '无会话，无工作目录';
+      out.log(`[ptt] ⚠️ ${msg}`);
+      wsText?.(msg);
+      speaker.say('没有会话');
+      return;
+    }
+    const cwd = rec.agent?.session?.header?.cwd ?? process.cwd();
+    let entries;
+    try {
+      entries = fs.readdirSync(cwd, { withFileTypes: true });
+    } catch (err) {
+      const msg = `读取目录失败: ${err?.message ?? err}`;
+      out.error(`[ptt] ❌ ${msg}`);
+      wsText?.(msg);
+      speaker.say('目录读取失败');
+      return;
+    }
+    const names = entries
+      .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+      .sort((a, b) => a.localeCompare(b));
+    const head = `当前目录: ${cwd}（${names.length} 项）`;
+    out.log(`[ptt] 📁 ${head}`);
+    for (const n of names) out.log('   ' + n);
+    const text = `${head}\n${names.join('\n')}`;
+    wsText?.(text);
+    speaker.say(`当前目录 ${cwd}`);
+  } catch (err) {
+    out.error(`[ptt] ❌ 列出目录失败: ${err?.message ?? err}`);
+    wsText?.(`列出目录失败：${err?.message ?? err}`);
   }
 }
 
@@ -90,20 +313,23 @@ async function showStatus(bridge, speaker, wsText) {
   speaker.say(statusText);
 }
 
-/** 帮助命令：列出所有语音命令 */
+/** 帮助命令：列出所有可用命令（含参数说明） */
 async function showHelp(speaker, wsText) {
   const cmds = [
-    '停止：中断当前回复',
-    '重置：清空上下文开新会话',
-    '模型：列出可用模型',
-    '压缩：压缩对话历史',
-    '目标：查看当前目标',
-    '状态：当前会话信息',
-    '帮助：列出命令',
+    '/stop 中断当前回复',
+    '/reset 清空上下文，开新会话',
+    '/status 当前会话信息（模式/会话/模型）',
+    '/model 列出所有可用模型 + 当前模型；/model <provider/model> 切换会话模型',
+    '/permission 列出所有权限 + 当前；/permission <名称> 切换权限',
+    '/fork 显示当前工作目录；/fork <路径> 切换工作目录',
+    '/workspace 列出当前目录内容（切换路径请用 /fork）',
+    '/compact 压缩对话历史',
+    '/goal 查看当前目标',
+    '/help 列出所有命令',
   ];
-  out.log('[ptt] 📖 语音命令:');
+  out.log('[ptt] 📖 可用命令:');
   for (const c of cmds) out.log('   ' + c);
-  const helpText = `语音命令：\n${cmds.join('\n')}`;
+  const helpText = `可用命令：\n${cmds.join('\n')}`;
   wsText?.(helpText);
   speaker.say(helpText);
 }
@@ -114,14 +340,18 @@ async function runDshCommand(ctx, bridge, line, speaker, wsText) {
     const rec = await bridge.ensure();
     if (!rec) {
       out.log(`[ptt] ⚠️ 无会话：无法执行 ${line}`);
+      wsText?.(`无会话：无法执行 ${line}`);
       speaker.say('会话不存在');
       return;
     }
     const { agent } = rec;
     const signal = new AbortController().signal;
-    const result = await ctx.commands.execute(agent, line, signal);
+    // commands.execute 签名是 (agent, line, images, signal)：第 3 参是命令图片附件，
+    // 第 4 参才是取消信号。compact/goal 无图片 → 传空数组占位，signal 放第 4 位。
+    const result = await ctx.commands.execute(agent, line, [], signal);
     if (!result) {
       out.log(`[ptt] ❓ 命令 ${line} 未识别`);
+      wsText?.(`命令 ${line} 未识别`);
       speaker.say('命令未识别');
       return;
     }
@@ -132,6 +362,7 @@ async function runDshCommand(ctx, bridge, line, speaker, wsText) {
     speaker.say(cmdText);
   } catch (err) {
     out.error(`[ptt] ❌ 命令执行失败: ${err?.message ?? err}`);
+    wsText?.(`命令执行失败：${err?.message ?? err}`);
     speaker.say('命令执行失败');
   }
 }
@@ -142,6 +373,9 @@ function matchCommand(text, config) {
   if (config.STOP_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'stop';
   if (config.RESET_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'reset';
   if (config.MODEL_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'model';
+  if (config.PERMISSION_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'permission';
+  if (config.FORK_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'fork';
+  if (config.WORKSPACE_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'workspace';
   if (config.STATUS_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'status';
   if (config.HELP_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'help';
   if (config.COMPACT_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'compact';
@@ -168,6 +402,7 @@ export async function apply(ctx, config) {
     PTT_ASR_API: 'transcribe',     // ASR API 路径（transcribe = /audio/transcriptions）
     PTT_ASR_KEY: '',               // ASR key（默认用 OMLX_API_KEY）
     PTT_ASR_MODEL: '',             // ASR 模型名（默认用 ASR_MODEL）
+    PTT_INPUT_IMAGE: 'none',       // 图片输入：ws(经 ws 收图片/图片+文字) | none；默认 none（与音频独立）
   };
   // 读取原始值 → 计算最终采用（env 优先 → 默认；ASR 空值回退配置）
   const envRaw = {};
@@ -206,6 +441,7 @@ export async function apply(ctx, config) {
   }
   cfg.INPUT_AUDIO = env.PTT_INPUT_AUDIO;
   cfg.INPUT_TEXT = env.PTT_INPUT_TEXT;
+  cfg.INPUT_IMAGE = env.PTT_INPUT_IMAGE;
   cfg.OUTPUT_TEXT = env.PTT_OUTPUT_TEXT;
   cfg.OUTPUT_AUDIO = env.PTT_OUTPUT_AUDIO;
   cfg.WS_URL = env.PTT_WS_URL;
@@ -298,6 +534,40 @@ export async function apply(ctx, config) {
     await handleCommand(text);
   };
 
+  // 通用：图片(+文字)输入（ws 图片消息：可能带文字）→ 发给模型（不做 runOnce）
+  const handleImageTextInput = async ({ text = '', images = [] } = {}) => {
+    // 图片输入独立于音频：PTT_INPUT_IMAGE=ws 才处理图片，否则忽略图片、只发文字
+    if (cfg.INPUT_IMAGE !== 'ws') {
+      out.log(`[ptt] 🕸️ 收到图片消息但 INPUT_IMAGE=${cfg.INPUT_IMAGE}，忽略图片`);
+      if (text) await handleTextInput(text);
+      return;
+    }
+    const blocks = [];
+    if (text) blocks.push({ type: 'text', text });
+    let imgCount = 0;
+    for (const img of images) {
+      if (!img?.data || !img?.mediaType) continue;
+      try {
+        const buf = Buffer.from(img.data, 'base64');
+        const [ref] = await ctx.get('attachments').saveImages([
+          { data: new Uint8Array(buf), mediaType: img.mediaType },
+        ]);
+        blocks.push({ type: 'image', attachment: ref });
+        imgCount++;
+      } catch (err) {
+        out.error(`[ptt] ❌ 图片保存失败(${img.mediaType}): ${err?.message ?? err}`);
+      }
+    }
+    if (!blocks.length) return;
+    out.log(`[ptt] 📤 发给模型: ${text || ''}${imgCount ? ` [${imgCount} 张图片]` : ''}`);
+    out.log('');
+    const r = await bridge.talkUserContent(blocks);
+    if (r.noSession) {
+      out.log('[ptt] ⚠️ 无会话：请先在聊天软件发条消息');
+      speaker.say('会话不存在，请先在聊天软件发消息');
+    }
+  };
+
   // 通用：执行语音/文本命令（B键 / ws /命令）
   const handleCommand = async (text) => {
     const cmd = matchCommand(text, cfg);
@@ -306,7 +576,21 @@ export async function apply(ctx, config) {
       if (cfg.OUTPUT_TEXT === 'ws') wsChannel.broadcastText(t, 'reply');
     };
     if (cmd === 'model') {
-      await showModels(ctx, speaker, wsText);
+      await showModels(ctx, speaker, wsText, bridge, text);
+    } else if (cmd === 'permission') {
+      await showPermissions(ctx, speaker, wsText, bridge, text);
+    } else if (cmd === 'fork') {
+      await showWorkspace(ctx, speaker, wsText, bridge, text);
+    } else if (cmd === 'workspace') {
+      // 无参=列出当前目录；带参=提示改用 /fork
+      if (cmdArg(text)) {
+        const msg = '不支持，请用 /fork';
+        out.log(`[ptt] ℹ️ ${msg}`);
+        wsText?.(msg);
+        speaker.say(msg);
+      } else {
+        await showWorkspaceList(ctx, speaker, wsText, bridge);
+      }
     } else if (cmd === 'status') {
       await showStatus(bridge, speaker, wsText);
     } else if (cmd === 'help') {
@@ -334,7 +618,9 @@ export async function apply(ctx, config) {
         speaker.say('无法重置');
       }
     } else {
-      out.log(`[ptt] ❓ 未识别的命令: "${text}"（试试: ${[...cfg.STOP_KEYWORDS, ...cfg.RESET_KEYWORDS].slice(0, 6).join(' / ')}）`);
+      const msg = `未识别的命令: "${text}"（可用 /help 查看所有命令）`;
+      out.log(`[ptt] ❓ ${msg}`);
+      wsText?.(msg);
       speaker.say('未识别命令');
     }
   };
@@ -402,6 +688,16 @@ export async function apply(ctx, config) {
     wsChannel = startWs(
       {
         onText: (text) => {
+          // 图片+文字信封：{type:'user', text, images:[{mediaType,data}]} → 图片输入
+          let envelope = null;
+          try {
+            const o = JSON.parse(text);
+            if (o && o.type === 'user' && Array.isArray(o.images)) envelope = o;
+          } catch { /* 非 JSON → 按普通文本 */ }
+          if (envelope) {
+            runOnce(() => handleImageTextInput(envelope));
+            return;
+          }
           // 以 / 开头 = 命令；否则 = 正常对话文本输入
           if (text.startsWith('/')) {
             out.log(`[ptt] 🕸️ 命令: ${text}`);
@@ -416,6 +712,19 @@ export async function apply(ctx, config) {
             runOnce(() => handleWavInput(wav));
           } else {
             out.log(`[ptt] 🕸️ 收到 wav 但 INPUT_AUDIO=${cfg.INPUT_AUDIO}，忽略`);
+          }
+        },
+        onImage: ({ data, mediaType }) => {
+          // 图片输入：binary 图片帧 → 发给模型（无文字）
+          if (cfg.INPUT_IMAGE === 'ws') {
+            runOnce(() =>
+              handleImageTextInput({
+                text: '',
+                images: [{ data: Buffer.from(data).toString('base64'), mediaType }],
+              }),
+            );
+          } else {
+            out.log(`[ptt] 🕸️ 收到图片但 INPUT_IMAGE=${cfg.INPUT_IMAGE}，忽略`);
           }
         },
         onSpeak: (text) => out.log(`[ptt] 🕸️ 播报→ws: ${text}`),
@@ -480,5 +789,5 @@ export async function apply(ctx, config) {
   });
 
   out.log('[ptt] 对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）');
-  out.log(`[ptt] 输入: 音频=${cfg.INPUT_AUDIO} 文本=${cfg.INPUT_TEXT} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
+  out.log(`[ptt] 输入: 音频=${cfg.INPUT_AUDIO} 文本=${cfg.INPUT_TEXT} 图片=${cfg.INPUT_IMAGE} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
 }

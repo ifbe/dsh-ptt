@@ -1,6 +1,7 @@
 // ws 输入/输出通道：
-//   - text 消息：以 / 开头 = 命令（/stop、/model 等），否则 = 正常对话文本输入
-//   - binary 消息：检查是否为 wav（RIFF/WAVE 头）→ 存临时文件 → 走 ASR 流程
+//   - text 消息：以 / 开头 = 命令（/stop、/model 等），否则 = 正常对话文本输入；
+//     若是图片信封 JSON（{type:'user', text, images}）→ 图片(+文字)输入
+//   - binary 消息：wav（RIFF/WAVE 头）→ 走 ASR 流程；图片（魔法字节）→ 走图片输入流程
 //   - OUTPUT_AUDIO=ws 时：播报内容通过 ws 发给客户端（JSON {type:'speak', text}）
 import fs from 'node:fs';
 import http from 'node:http';
@@ -11,14 +12,51 @@ import { WebSocketServer } from 'ws';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
+/** 识别图片二进制 → 返回 mediaType；非图片返回 null */
+function sniffImage(buf) {
+  if (buf.length < 8) return null;
+  // WebP：RIFF....WEBP
+  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  // PNG：89 50 4E 47
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  // JPEG：FF D8 FF
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  // GIF：GIF8
+  if (buf.toString('ascii', 0, 4) === 'GIF8') return 'image/gif';
+  return null;
+}
+
+/**
+ * 日志用：屏蔽图片信封里的 base64，并截断超长文本，避免 stdout 被刷屏。
+ * 只影响显示，不影响传给 onText 的真实数据。
+ */
+function summarizeWsText(text) {
+  try {
+    const o = JSON.parse(text);
+    if (o && typeof o === 'object' && Array.isArray(o.images)) {
+      const copy = {
+        ...o,
+        images: o.images.map((img) => ({
+          ...img,
+          // 用长度占位，不打印真实 base64
+          data: img?.data ? `<base64 ${img.data.length} 字符，已省略>` : img?.data,
+        })),
+      };
+      const s = JSON.stringify(copy);
+      return s.length > 300 ? s.slice(0, 300) + '…' : s;
+    }
+  } catch { /* 非 JSON → 走普通截断 */ }
+  return text.length > 300 ? text.slice(0, 300) + '…' : text;
+}
+
 /**
  * 启动 ws server。
- * @param {object} handlers {onText(text), onWav(wavPath), onSpeak(text)}
+ * @param {object} handlers {onText(text), onWav(wavPath), onImage({data,mediaType}), onSpeak(text)}
  * @param {string} url 如 ws://127.0.0.1:9001（只取 host:port）
  * @param {object} logger
  * @returns {{dispose():void}}
  */
-export function startWs({ onText, onWav, onSpeak }, url, logger = console) {
+export function startWs({ onText, onWav, onImage, onSpeak }, url, logger = console) {
   // cordis logger 没有 .log，统一走包装（兼容 console/cordis）
   const log = (...args) => {
     try {
@@ -84,7 +122,7 @@ export function startWs({ onText, onWav, onSpeak }, url, logger = console) {
   });
   server.listen(port, host);
   const wss = new WebSocketServer({ server });
-  log(`[ptt] 🕸️ ws+http server: ws://${host}:${port}（text=对话/命令，binary=wav 语音；http://${host}:${port}/test.html）`);
+  log(`[ptt] 🕸️ ws+http server: ws://${host}:${port}（text=对话/命令/图片信封，binary=wav/图片；http://${host}:${port}/test.html）`);
 
   const send = (ws, obj) => {
     try {
@@ -97,7 +135,7 @@ export function startWs({ onText, onWav, onSpeak }, url, logger = console) {
     ws.on('message', (data, isBinary) => {
       try {
         if (isBinary) {
-          // 检查 wav 头：RIFF....WAVE
+          // 检查 wav 头：RIFF....WAVE；否则尝试识别图片
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
           if (buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WAVE') {
             const wavPath = `/tmp/dsh_ptt_ws.wav`;
@@ -105,12 +143,18 @@ export function startWs({ onText, onWav, onSpeak }, url, logger = console) {
             log(`[ptt] 🕸️ 收到 wav（${buf.length} 字节）→ ${wavPath}`);
             onWav?.(wavPath);
           } else {
-            log(`[ptt] 🕸️ 收到 binary 但非 wav（前 12 字节: ${buf.slice(0, 12).toString('hex')}），忽略`);
+            const mediaType = sniffImage(buf);
+            if (mediaType) {
+              log(`[ptt] 🕸️ 收到图片（${mediaType}，${buf.length} 字节）`);
+              onImage?.({ data: buf, mediaType });
+            } else {
+              log(`[ptt] 🕸️ 收到 binary 但非 wav/图片（前 12 字节: ${buf.slice(0, 12).toString('hex')}），忽略`);
+            }
           }
         } else {
           const text = data.toString('utf8').trim();
           if (!text) return;
-          log(`[ptt] 🕸️ 收到文本: ${text}`);
+          log(`[ptt] 🕸️ 收到文本: ${summarizeWsText(text)}`);
           onText?.(text);
         }
       } catch (err) {
