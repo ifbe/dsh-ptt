@@ -15,7 +15,7 @@ const out = createOutputQueue();
 import { transcribe } from './asr.js';
 import { SessionBridge, manageSessions } from './session.js';
 import { Speaker } from './speaker.js';
-import { ttsWav, resolvePlayer } from './tts.js';
+import { ttsWav, resolvePlayer, wavPlayer } from './tts.js';
 
 export const name = 'ptt';
 export const inject = ['agents', 'credentials', 'llm', 'agentDefaultModel', 'commands', 'sessionPersistence'];
@@ -525,18 +525,21 @@ export async function apply(ctx, config) {
   env.PTT_TTS_URL ||= cfg.OMLX_BASE_URL ?? '';
   env.PTT_TTS_KEY ||= cfg.OMLX_API_KEY ?? '';
   env.PTT_TTS_MODEL ||= 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
-  // PTT_OUTPUT_AUDIO=auto：检测 macOS + say 命令，没有则 none（树莓派等 Linux 无 say）
-  if (env.PTT_OUTPUT_AUDIO === 'auto') {
-    let hasSay = false;
-    try {
-      execFileSync('which', ['say'], { stdio: 'ignore' });
-      hasSay = process.platform === 'darwin';
-    } catch { /* 无 say */ }
-    env.PTT_OUTPUT_AUDIO = hasSay ? 'say' : 'none';
-  }
   // PTT_TTS 未显式设置（空/未设）→ 智能探测可用合成器：①openai(调接口查模型) ②macOS say ③none
+  // 先于 OUTPUT_AUDIO=auto 判断，因为 auto 要看 PTT_TTS 是否 openai
   if (!process.env.PTT_TTS) {
     env.PTT_TTS = await detectBestTts(env, cfg);
+  }
+  // PTT_OUTPUT_AUDIO=auto：有 macOS say，或已配 openai TTS 且有本地播放器 → say；否则 none
+  if (env.PTT_OUTPUT_AUDIO === 'auto') {
+    let sayable = false;
+    try {
+      execFileSync('which', ['say'], { stdio: 'ignore' });
+      sayable = process.platform === 'darwin';
+    } catch { /* 无 say */ }
+    // 无 macOS say 时：openai TTS + 本地播放器 → 仍可本地播（树莓派等 Linux 无 say 也能出声）
+    if (!sayable && env.PTT_TTS === 'openai' && (process.env.PTT_TTS_PLAYER || wavPlayer())) sayable = true;
+    env.PTT_OUTPUT_AUDIO = sayable ? 'say' : 'none';
   }
   // PTT_ASR 未显式设置（空/未设）→ 智能探测可用 ASR：①openai(调接口查模型) ②none
   if (!process.env.PTT_ASR) {
@@ -601,9 +604,16 @@ export async function apply(ctx, config) {
   }
 
   // 会话打印放最开头之后，再打印环境变量（读取值 + 最终值）
+  // PTT_WS_URL + 3 个 input + 2 个 output 挪到最后打印（按 IO_ORDER），其余先打
+  const IO_ORDER = ['PTT_WS_URL', 'PTT_INPUT_AUDIO', 'PTT_INPUT_TEXT', 'PTT_INPUT_IMAGE', 'PTT_OUTPUT_TEXT', 'PTT_OUTPUT_AUDIO'];
+  const ioSet = new Set(IO_ORDER);
+  const ioLines = new Map();
   for (const name of Object.keys(ENV_DEFAULTS)) {
-    out.log(`[ptt] env ${name} 读取=${envRaw[name]} 最终=${env[name] || '(空)'}`);
+    const line = `[ptt] env ${name} 读取=${envRaw[name]} 最终=${env[name] || '(空)'}`;
+    if (ioSet.has(name)) { ioLines.set(name, line); continue; }
+    out.log(line);
   }
+  for (const name of IO_ORDER) if (ioLines.has(name)) out.log(ioLines.get(name)); // 3 input + 2 output 最后打
 
   if (mode === 'standalone') {
     // 独立模式：启动即恢复/创建 ptt 自己的会话
