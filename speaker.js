@@ -7,6 +7,7 @@
 //
 // 所有 stdout 输出走统一队列（_write），避免流式 chunk 与日志/工具打印交错。
 import { spawn } from 'node:child_process';
+import { ttsWav, playWavBuffer } from './tts.js';
 
 /** 从消息 content 数组提取文本（递归处理 tool-result） */
 function extractText(content) {
@@ -172,9 +173,13 @@ export class Speaker {
     }
   }
 
-  /** 语音播报：入队串行播放（不并发不丢弃） */
+  /** 语音播报：入队串行播放（不并发不丢弃）。TTS 不可用时打印报错、不崩溃。 */
   say(text) {
-    if (this.config.PTT_TTS === 'none' || !this.config.SPEAK_REPLY) return;
+    if (this.config.PTT_TTS === 'none') {
+      this.out.error('[ptt] ⚠️ 无有效TTS工具（PTT_TTS=none），播放语音失败，已跳过');
+      return;
+    }
+    if (!this.config.SPEAK_REPLY) return;
     this.sayQueue.push(text);
     this._pump();
   }
@@ -182,13 +187,30 @@ export class Speaker {
   _pump() {
     if (this.playing || this.sayQueue.length === 0) return;
     const text = this.sayQueue.shift();
-    // 截断超长文本，避免单条 say 卡死
+    // 截断超长文本，避免单条说太久
     const t = text.length > 500 ? `${text.slice(0, 500)}…` : text;
     this.playing = true;
-    const p = spawn('say', ['-v', this.config.VOICE_NAME, t], { stdio: 'ignore' });
-    p.on('exit', () => {
+    this._playOne(t).finally(() => {
       this.playing = false;
       this._pump(); // 播完下一条
+    });
+  }
+
+  /** 播一条：openai → 合成 wav 本地播放；say → macOS 直接播 */
+  async _playOne(text) {
+    const cfg = this.config;
+    if (cfg.PTT_TTS === 'openai') {
+      const r = await ttsWav(text, cfg);
+      if (r.error) { this.out.error(`[ptt] ❌ 语音生成失败: ${r.error}`); return; }
+      const perr = await playWavBuffer(r.wav, cfg);
+      if (perr) this.out.error(`[ptt] ❌ 本地播放失败: ${perr}`);
+      return;
+    }
+    // say（macOS 本地直接播）
+    await new Promise((resolve) => {
+      const p = spawn('say', ['-v', cfg.VOICE_NAME, text], { stdio: 'ignore' });
+      p.on('error', (e) => { this.out.error(`[ptt] ❌ 语音播报失败（say 不可用）: ${e?.message ?? e}`); resolve(); });
+      p.on('exit', resolve);
     });
   }
 }

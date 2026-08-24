@@ -3,7 +3,7 @@
 //
 // 所有配置来自 profile 的 cordis.patch.yml（ptt 行的 config 段）——
 // 那是本插件的唯一配置文件，只影响 ptt profile，不影响其他 profile。
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import readline from 'node:readline';
 import { startGamepad } from './gamepad.js';
@@ -15,6 +15,7 @@ const out = createOutputQueue();
 import { transcribe } from './asr.js';
 import { SessionBridge, manageSessions } from './session.js';
 import { Speaker } from './speaker.js';
+import { ttsWav, resolvePlayer } from './tts.js';
 
 export const name = 'ptt';
 export const inject = ['agents', 'credentials', 'llm', 'agentDefaultModel', 'commands', 'sessionPersistence'];
@@ -47,6 +48,7 @@ const DEFAULTS = {
   HELP_KEYWORDS: ['help', '帮助', '有什么命令', '有哪些命令'],
   COMPACT_KEYWORDS: ['compact', '压缩', '压缩一下'],
   GOAL_KEYWORDS: ['goal', '目标', '当前目标'],
+  BASH_KEYWORDS: ['bash', 'shell', '执行命令'],
 
   // 调试：true 时 ASR 结果只打印，不发给模型、不执行命令
   ASR_DEBUG: false,
@@ -55,6 +57,70 @@ const DEFAULTS = {
 /** 解析 /cmd 文本里的参数（第一个 token 之后的部分） */
 function cmdArg(cmdText) {
   return (cmdText ?? '').trim().split(/\s+/).slice(1).join(' ').trim();
+}
+
+/**
+ * PTT_TTS 未显式设置时的智能探测：按优先级返回可用合成器。
+ *   ①openai：调 omlx /v1/models 看 TTS 模型是否在列（存在即认为可用）
+ *   ②say：macOS 且有 say 命令
+ *   ③none：都没有
+ * 返回 'openai' | 'say' | 'none'。
+ */
+async function detectBestTts(env, cfg) {
+  const baseUrl = (env.PTT_TTS_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
+  const apiKey = env.PTT_TTS_KEY || cfg.OMLX_API_KEY || '';
+  const model = env.PTT_TTS_MODEL || 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
+  // ① openai：有 omlx 配置 → 查模型；查不到也尽量用 openai（服务器可能开着）
+  if (baseUrl) {
+    try {
+      const res = await fetch(`${baseUrl}/models`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (res.ok) {
+        const ids = ((await res.json())?.data ?? []).map((m) => m.id);
+        if (ids.includes(model)) return 'openai';
+        // 明确确认模型不存在 → 落 say/none
+      } else {
+        // 接口异常（非网络）：服务器在，保守 openai
+        return 'openai';
+      }
+    } catch {
+      // 网络不可达：服务器可能在，保守 openai
+      return 'openai';
+    }
+  }
+  // ② say：macOS + 有 say 命令
+  if (process.platform === 'darwin') {
+    try { execFileSync('which', ['say'], { stdio: 'ignore' }); return 'say'; } catch { /* 无 say */ }
+  }
+  // ③ 都没有
+  return 'none';
+}
+
+/**
+ * PTT_ASR 未显式设置时的智能探测（ASR 没有 say 类备选，只有 openai/none）：
+ *   ①openai：调 omlx /v1/models 看 ASR 模型是否在列
+ *   ②none：确认模型不在（或没配端点/模型）→ 禁用
+ *   ③接口不可达/异常 → 服务器可能开着，保守用 openai（不轻易禁用）
+ * 返回 'openai' | 'none'。
+ */
+async function detectBestAsr(env, cfg) {
+  const baseUrl = (env.PTT_ASR_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
+  const apiKey = env.PTT_ASR_KEY || cfg.OMLX_API_KEY || '';
+  const model = env.PTT_ASR_MODEL || cfg.ASR_MODEL || '';
+  if (!baseUrl || !model) return 'none';
+  try {
+    const res = await fetch(`${baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const ids = ((await res.json())?.data ?? []).map((m) => m.id);
+      return ids.includes(model) ? 'openai' : 'none'; // 明确确认存在/不存在
+    }
+  } catch { /* 接口不可达/异常 → 服务器可能在，保守用 openai */ }
+  return 'openai';
 }
 
 /**
@@ -325,6 +391,7 @@ async function showHelp(speaker, wsText) {
     '/workspace 列出当前目录内容（切换路径请用 /fork）',
     '/compact 压缩对话历史',
     '/goal 查看当前目标',
+    '/bash 执行 bash 命令（无参=运行 bash --version；/bash <命令> 执行并输出）',
     '/help 列出所有命令',
   ];
   out.log('[ptt] 📖 可用命令:');
@@ -332,6 +399,39 @@ async function showHelp(speaker, wsText) {
   const helpText = `可用命令：\n${cmds.join('\n')}`;
   wsText?.(helpText);
   speaker.say(helpText);
+}
+
+/** 执行一条 bash 命令（execFile 非阻塞，带超时），结果输出到 stdout/ws/语音 */
+async function runBash(speaker, wsText, bridge, cmdText) {
+  const arg = cmdArg(cmdText);
+  const cmd = arg ? ['bash', '-c', arg] : ['bash', '--version'];
+  // 在会话当前工作目录执行
+  let cwd = process.cwd();
+  try {
+    const rec = await bridge.ensure();
+    cwd = rec?.agent?.session?.header?.cwd ?? process.cwd();
+  } catch { /* 无会话 → 用进程 cwd */ }
+  try {
+    const { err, stdout, stderr } = await new Promise((resolve) => {
+      execFile(cmd[0], cmd.slice(1), { cwd, timeout: 30000, maxBuffer: 1024 * 1024 }, (e, so, se) => {
+        resolve({ err: e, stdout: so ?? '', stderr: se ?? '' });
+      });
+    });
+    const parts = [];
+    if (stdout.trim()) parts.push(stdout.trim());
+    if (stderr.trim()) parts.push(stderr.trim());
+    let output = parts.join('\n');
+    if (err) output += `\n⚠️ 命令退出异常（${err?.code ?? err?.message ?? '失败'}）`;
+    if (!output.trim()) output = '(无输出)';
+    out.log(`[ptt] 💻 /bash ${arg || '--version'}:\n${output}`);
+    wsText?.(`/bash 输出:\n${output}`);
+    speaker.say(`bash 结果：${output.slice(0, 120)}`);
+  } catch (ex) {
+    const msg = `bash 执行失败: ${ex?.message ?? ex}`;
+    out.error(`[ptt] ❌ ${msg}`);
+    wsText?.(msg);
+    speaker.say('bash 执行失败');
+  }
 }
 
 /** 执行 DSH 原生命令（compact/goal），打印并播报结果 */
@@ -380,6 +480,7 @@ function matchCommand(text, config) {
   if (config.HELP_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'help';
   if (config.COMPACT_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'compact';
   if (config.GOAL_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'goal';
+  if (config.BASH_KEYWORDS.some((k) => t.includes(k.toLowerCase()))) return 'bash';
   return null;
 }
 
@@ -396,7 +497,12 @@ export async function apply(ctx, config) {
     PTT_OUTPUT_AUDIO: 'auto',      // 语音输出：say(macOS) | ws | none；auto=自动检测（macOS+有say才say，否则none）
     PTT_MODEL: '',                 // LLM 模型 provider/model（如 omlx/Qwen3.6-35B-A3B-4bit），空=用配置
     PTT_WS_URL: '',                // ws 输入/输出地址（PTT_INPUT_AUDIO=ws 或 PTT_OUTPUT_AUDIO=ws 时必填）
-    PTT_TTS: 'say',                // 语音合成：say(macOS) | none
+    PTT_TTS: 'say',                // 语音合成：say(macOS) | openai(omlx /v1/audio/speech) | none
+    PTT_TTS_URL: '',               // openai TTS 端点（默认用 OMLX_BASE_URL）
+    PTT_TTS_MODEL: '',             // openai TTS 模型名（默认 Qwen3-TTS-12Hz-0.6B-Base-4bit）
+    PTT_TTS_KEY: '',               // openai TTS key（默认用 OMLX_API_KEY）
+    PTT_TTS_VOICE: 'alloy',        // openai TTS 音色
+    PTT_TTS_PLAYER: '',            // 本地播放器命令(afplay/aplay/paplay/ffplay)，空=自动探测
     PTT_ASR: 'openai',             // ASR 方式：openai(OpenAI 兼容) | none
     PTT_ASR_URL: '',               // ASR 端点（默认用 OMLX_BASE_URL）
     PTT_ASR_API: 'transcribe',     // ASR API 路径（transcribe = /audio/transcriptions）
@@ -416,6 +522,9 @@ export async function apply(ctx, config) {
   env.PTT_ASR_URL ||= cfg.OMLX_BASE_URL ?? '';
   env.PTT_ASR_KEY ||= cfg.OMLX_API_KEY ?? '';
   env.PTT_ASR_MODEL ||= cfg.ASR_MODEL ?? '';
+  env.PTT_TTS_URL ||= cfg.OMLX_BASE_URL ?? '';
+  env.PTT_TTS_KEY ||= cfg.OMLX_API_KEY ?? '';
+  env.PTT_TTS_MODEL ||= 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
   // PTT_OUTPUT_AUDIO=auto：检测 macOS + say 命令，没有则 none（树莓派等 Linux 无 say）
   if (env.PTT_OUTPUT_AUDIO === 'auto') {
     let hasSay = false;
@@ -424,6 +533,14 @@ export async function apply(ctx, config) {
       hasSay = process.platform === 'darwin';
     } catch { /* 无 say */ }
     env.PTT_OUTPUT_AUDIO = hasSay ? 'say' : 'none';
+  }
+  // PTT_TTS 未显式设置（空/未设）→ 智能探测可用合成器：①openai(调接口查模型) ②macOS say ③none
+  if (!process.env.PTT_TTS) {
+    env.PTT_TTS = await detectBestTts(env, cfg);
+  }
+  // PTT_ASR 未显式设置（空/未设）→ 智能探测可用 ASR：①openai(调接口查模型) ②none
+  if (!process.env.PTT_ASR) {
+    env.PTT_ASR = await detectBestAsr(env, cfg);
   }
   // PTT_MODEL=provider/model → 覆盖 LLM 配置
   if (env.PTT_MODEL) {
@@ -435,10 +552,6 @@ export async function apply(ctx, config) {
       out.log(`[ptt] ⚠️ PTT_MODEL 格式错误（应为 provider/model）: ${env.PTT_MODEL}`);
     }
   }
-  // 同一行打印：读取值 + 最终值
-  for (const name of Object.keys(ENV_DEFAULTS)) {
-    out.log(`[ptt] env ${name} 读取=${envRaw[name]} 最终=${env[name] || '(空)'}`);
-  }
   cfg.INPUT_AUDIO = env.PTT_INPUT_AUDIO;
   cfg.INPUT_TEXT = env.PTT_INPUT_TEXT;
   cfg.INPUT_IMAGE = env.PTT_INPUT_IMAGE;
@@ -446,6 +559,11 @@ export async function apply(ctx, config) {
   cfg.OUTPUT_AUDIO = env.PTT_OUTPUT_AUDIO;
   cfg.WS_URL = env.PTT_WS_URL;
   cfg.PTT_TTS = env.PTT_TTS;
+  cfg.PTT_TTS_URL = env.PTT_TTS_URL;
+  cfg.PTT_TTS_MODEL = env.PTT_TTS_MODEL;
+  cfg.PTT_TTS_KEY = env.PTT_TTS_KEY;
+  cfg.PTT_TTS_VOICE = env.PTT_TTS_VOICE;
+  cfg.PTT_TTS_PLAYER = env.PTT_TTS_PLAYER;
   cfg.PTT_ASR = env.PTT_ASR;
   cfg.PTT_ASR_URL = env.PTT_ASR_URL;
   cfg.PTT_ASR_API = env.PTT_ASR_API;
@@ -473,6 +591,11 @@ export async function apply(ctx, config) {
     }
   }, out);
   const { mode } = await manageSessions(ctx, bridge);
+
+  // 会话打印放最开头之后，再打印环境变量（读取值 + 最终值）
+  for (const name of Object.keys(ENV_DEFAULTS)) {
+    out.log(`[ptt] env ${name} 读取=${envRaw[name]} 最终=${env[name] || '(空)'}`);
+  }
 
   if (mode === 'standalone') {
     // 独立模式：启动即恢复/创建 ptt 自己的会话
@@ -597,6 +720,8 @@ export async function apply(ctx, config) {
       await showHelp(speaker, wsText);
     } else if (cmd === 'compact' || cmd === 'goal') {
       await runDshCommand(ctx, bridge, cmd === 'compact' ? '/compact' : '/goal', speaker, wsText);
+    } else if (cmd === 'bash') {
+      await runBash(speaker, wsText, bridge, text);
     } else if (cmd === 'stop') {
       if (bridge.stop()) {
         out.log('[ptt] ⏹️ 已发送停止');
@@ -760,17 +885,19 @@ export async function apply(ctx, config) {
   if (cfg.OUTPUT_AUDIO === 'none') {
     speaker.say = () => {}; // 无语音输出
   } else if (cfg.OUTPUT_AUDIO === 'ws') {
-    speaker.say = (text) => {
-      // say -o 生成 wav → base64 广播给 ws 客户端（由客户端播报）
-      const wavPath = `/tmp/dsh_ptt_say_${Date.now()}.wav`;
-      const p = spawn('say', ['-v', cfg.VOICE_NAME, '-o', wavPath, '--data-format=LEI16@16000', text], { stdio: 'ignore' });
-      p.on('exit', () => {
-        try {
-          const buf = fs.readFileSync(wavPath);
-          wsChannel.broadcastAudio(buf); // 二进制 wav 直发
-          fs.rmSync(wavPath, { force: true });
-        } catch { /* 生成失败忽略 */ }
-      });
+    speaker.say = async (text) => {
+      // TTS 不可用（PTT_TTS=none）→ 打印报错、不生成 wav、不崩溃
+      if (cfg.PTT_TTS === 'none') {
+        out.error('[ptt] ⚠️ 无有效TTS工具（PTT_TTS=none），发送wav给ws失败，已跳过语音');
+        return;
+      }
+      // ttsWav 按 PTT_TTS 生成 wav（openai→omlx / say→macOS say -o）
+      const r = await ttsWav(text, cfg);
+      if (r.error) {
+        out.error(`[ptt] ❌ TTS 生成失败，发送wav给ws失败: ${r.error}`);
+        return;
+      }
+      wsChannel.broadcastAudio(r.wav); // 二进制 wav 直发（网页 <audio> 播）
     };
   } else {
     speaker.say = origSay;
@@ -790,4 +917,8 @@ export async function apply(ctx, config) {
 
   out.log('[ptt] 对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）');
   out.log(`[ptt] 输入: 音频=${cfg.INPUT_AUDIO} 文本=${cfg.INPUT_TEXT} 图片=${cfg.INPUT_IMAGE} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
+  // 解析并打印本地播放器（openai TTS 本地播报用；PTT_TTS_PLAYER 指定 / 按 OS 探测）
+  const localPlayer = resolvePlayer(cfg);
+  cfg.LOCAL_PLAYER = localPlayer;
+  out.log(`[ptt] 🔊 本地播放器: ${localPlayer || '未找到（openai 语音无法本地播放；请设 PTT_TTS_PLAYER 或装 aplay/paplay/ffplay）'}`);
 }

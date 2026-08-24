@@ -74,8 +74,13 @@ dsh --profile ptt
 | `PTT_OUTPUT_AUDIO` | say / ws / none / auto | auto | 语音输出（auto=macOS 有 say 才 say，否则 none） |
 | `PTT_MODEL` | provider/model | 空 | 覆盖 LLM 模型 |
 | `PTT_WS_URL` | ws://host:port | 空 | ws 地址（音频/文字走 ws 时必填，兼作 web 界面） |
-| `PTT_TTS` | say / none | say | 语音合成 |
-| `PTT_ASR` | openai / none | openai | ASR 方式 |
+| `PTT_TTS` | say / openai / none | 自动探测 | 语音合成；未设置时按 ①openai(调 /v1/models 查模型) ②macOS say ③none 自动选 |
+| `PTT_TTS_URL` | url | OMLX_BASE_URL | openai TTS 端点（`/v1/audio/speech`） |
+| `PTT_TTS_MODEL` | model | Qwen3-TTS-12Hz-0.6B-Base-4bit | openai TTS 模型 |
+| `PTT_TTS_KEY` | key | OMLX_API_KEY | openai TTS key |
+| `PTT_TTS_VOICE` | voice | alloy | openai TTS 音色 |
+| `PTT_TTS_PLAYER` | cmd | 空 | 本地播放器；空=按 OS 探测（macOS→afplay，Linux→aplay/paplay/ffplay），启动时打印所选 |
+| `PTT_ASR` | openai / none | 自动探测 | ASR 方式；未设置时按 ①openai(调 /v1/models 查模型) ②none 自动选 |
 | `PTT_ASR_URL` | url | OMLX_BASE_URL | ASR 端点 |
 | `PTT_ASR_API` | transcribe | transcribe | ASR 接口路径 |
 | `PTT_ASR_KEY` | key | OMLX_API_KEY | ASR key |
