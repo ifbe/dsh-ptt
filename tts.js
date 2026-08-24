@@ -7,7 +7,8 @@ import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 
 /** macOS say -o 生成 wav 文件 */
-async function sayWav(text, cfg) {
+async function sayWav(text, cfg, out) {
+  out?.log?.(`[ptt] 🎤 TTS 合成中...（${text.length} 字）`);
   const wavPath = `/tmp/dsh_ptt_tts_${Date.now()}.wav`;
   await new Promise((resolve, reject) => {
     const p = spawn('say', ['-v', cfg.VOICE_NAME, '-o', wavPath, '--data-format=LEI16@16000', text]);
@@ -16,11 +17,13 @@ async function sayWav(text, cfg) {
   });
   const buf = fs.readFileSync(wavPath);
   fs.rmSync(wavPath, { force: true });
+  out?.log?.(`[ptt] 🎤 TTS 收到 wav（${buf.length} 字节）`);
   return buf;
 }
 
 /** openai：调 omlx /v1/audio/speech → wav 缓冲 */
-async function openaiWav(text, cfg) {
+async function openaiWav(text, cfg, out) {
+  out?.log?.(`[ptt] 🎤 TTS 合成中...（${text.length} 字）`);
   const baseUrl = (cfg.PTT_TTS_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
   const apiKey = cfg.PTT_TTS_KEY || cfg.OMLX_API_KEY || '';
   const model = cfg.PTT_TTS_MODEL || 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
@@ -33,19 +36,22 @@ async function openaiWav(text, cfg) {
     signal: AbortSignal.timeout(30000),
   });
   if (!res.ok) throw new Error(`TTS HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  return Buffer.from(await res.arrayBuffer());
+  const buf = Buffer.from(await res.arrayBuffer());
+  out?.log?.(`[ptt] 🎤 TTS 收到 wav（${buf.length} 字节）`);
+  return buf;
 }
 
 /**
  * 生成语音 wav 缓冲。返回 {wav: Buffer} 或 {error: string}。
  * @param text 要朗读的文本
  * @param cfg 插件配置（PTT_TTS / VOICE_NAME / OMLX_BASE_URL / PTT_TTS_*）
+ * @param out 日志输出（可选，带 .log）
  */
-export async function ttsWav(text, cfg) {
+export async function ttsWav(text, cfg, out) {
   try {
     if (cfg.PTT_TTS === 'none') return { error: '无有效TTS工具（PTT_TTS=none）' };
-    if (cfg.PTT_TTS === 'openai') return { wav: await openaiWav(text, cfg) };
-    if (cfg.PTT_TTS === 'say') return { wav: await sayWav(text, cfg) };
+    if (cfg.PTT_TTS === 'openai') return { wav: await openaiWav(text, cfg, out) };
+    if (cfg.PTT_TTS === 'say') return { wav: await sayWav(text, cfg, out) };
     return { error: `未知 PTT_TTS=${cfg.PTT_TTS}` };
   } catch (err) {
     return { error: err?.message ?? String(err) };
@@ -77,11 +83,12 @@ export function resolvePlayer(cfg) {
  * @param buf wav 缓冲
  * @param cfg
  */
-export function playWavBuffer(buf, cfg) {
+export function playWavBuffer(buf, cfg, out) {
   const player = cfg.LOCAL_PLAYER ?? resolvePlayer(cfg);
   if (!player) return '没有可用的本地播放器（afplay/aplay/paplay/ffplay）';
   const wavPath = `/tmp/dsh_ptt_play_${Date.now()}.wav`;
   fs.writeFileSync(wavPath, buf);
+  out?.log?.(`[ptt] 🔊 播放命令: ${player} ${wavPath}`);
   return new Promise((resolve) => {
     const p = spawn(player, [wavPath], { stdio: 'ignore' });
     const cleanup = () => { try { fs.rmSync(wavPath, { force: true }); } catch { /* ignore */ } };

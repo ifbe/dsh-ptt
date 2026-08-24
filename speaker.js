@@ -200,9 +200,9 @@ export class Speaker {
   async _playOne(text) {
     const cfg = this.config;
     if (cfg.PTT_TTS === 'openai') {
-      const r = await ttsWav(text, cfg);
+      const r = await ttsWav(text, cfg, this.out);
       if (r.error) { this.out.error(`[ptt] ❌ 语音生成失败: ${r.error}`); return; }
-      const perr = await playWavBuffer(r.wav, cfg);
+      const perr = await playWavBuffer(r.wav, cfg, this.out);
       if (perr) this.out.error(`[ptt] ❌ 本地播放失败: ${perr}`);
       return;
     }

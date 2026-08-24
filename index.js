@@ -592,6 +592,14 @@ export async function apply(ctx, config) {
   }, out);
   const { mode } = await manageSessions(ctx, bridge);
 
+  // 解析本地播放器：未指定则按 OS 探测，作为 PTT_TTS_PLAYER 的最终值打印（读取=xxx 最终=yyy）
+  const localPlayer = resolvePlayer(cfg);
+  cfg.LOCAL_PLAYER = localPlayer;
+  if (!env.PTT_TTS_PLAYER) {
+    env.PTT_TTS_PLAYER = localPlayer ?? '';
+    cfg.PTT_TTS_PLAYER = env.PTT_TTS_PLAYER;
+  }
+
   // 会话打印放最开头之后，再打印环境变量（读取值 + 最终值）
   for (const name of Object.keys(ENV_DEFAULTS)) {
     out.log(`[ptt] env ${name} 读取=${envRaw[name]} 最终=${env[name] || '(空)'}`);
@@ -892,7 +900,7 @@ export async function apply(ctx, config) {
         return;
       }
       // ttsWav 按 PTT_TTS 生成 wav（openai→omlx / say→macOS say -o）
-      const r = await ttsWav(text, cfg);
+      const r = await ttsWav(text, cfg, out);
       if (r.error) {
         out.error(`[ptt] ❌ TTS 生成失败，发送wav给ws失败: ${r.error}`);
         return;
@@ -917,8 +925,6 @@ export async function apply(ctx, config) {
 
   out.log('[ptt] 对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）');
   out.log(`[ptt] 输入: 音频=${cfg.INPUT_AUDIO} 文本=${cfg.INPUT_TEXT} 图片=${cfg.INPUT_IMAGE} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
-  // 解析并打印本地播放器（openai TTS 本地播报用；PTT_TTS_PLAYER 指定 / 按 OS 探测）
-  const localPlayer = resolvePlayer(cfg);
-  cfg.LOCAL_PLAYER = localPlayer;
-  out.log(`[ptt] 🔊 本地播放器: ${localPlayer || '未找到（openai 语音无法本地播放；请设 PTT_TTS_PLAYER 或装 aplay/paplay/ffplay）'}`);
+  // 本地播放器已在上方解析并写入 PTT_TTS_PLAYER 最终值；这里仅打印（取自缓存）
+  out.log(`[ptt] 🔊 本地播放器: ${cfg.LOCAL_PLAYER || '未找到（openai 语音无法本地播放；请设 PTT_TTS_PLAYER 或装 aplay/paplay/ffplay）'}`);
 }
