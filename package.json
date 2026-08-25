@@ -1,6 +1,6 @@
 {
   "name": "dsh-ptt",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "极简对讲机插件：手柄A键按住说话(ASR->DSH会话)，B键语音命令；命令包括 /model /permission /fork /workspace /bash /compact /goal /status /stop /reset /help；支持 ws 图片输入(PTT_INPUT_IMAGE)与 openai TTS(PTT_TTS=openai，omlx /v1/audio/speech)，ASR/TTS 未设置时自动探测",
   "type": "module",
   "main": "./index.js",

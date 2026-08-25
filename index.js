@@ -15,7 +15,7 @@ const out = createOutputQueue();
 import { transcribe } from './asr.js';
 import { SessionBridge, manageSessions } from './session.js';
 import { Speaker } from './speaker.js';
-import { ttsWav, resolvePlayer, wavPlayer } from './tts.js';
+import { ttsWav, wavPlayer } from './tts.js';
 
 export const name = 'ptt';
 export const inject = ['agents', 'credentials', 'llm', 'agentDefaultModel', 'commands', 'sessionPersistence'];
@@ -502,7 +502,6 @@ export async function apply(ctx, config) {
     PTT_TTS_MODEL: '',             // openai TTS 模型名（默认 Qwen3-TTS-12Hz-0.6B-Base-4bit）
     PTT_TTS_KEY: '',               // openai TTS key（默认用 OMLX_API_KEY）
     PTT_TTS_VOICE: 'alloy',        // openai TTS 音色
-    PTT_TTS_PLAYER: '',            // 本地播放器命令(afplay/aplay/paplay/ffplay)，空=自动探测
     PTT_ASR: 'openai',             // ASR 方式：openai(OpenAI 兼容) | none
     PTT_ASR_URL: '',               // ASR 端点（默认用 OMLX_BASE_URL）
     PTT_ASR_API: 'transcribe',     // ASR API 路径（transcribe = /audio/transcriptions）
@@ -528,18 +527,29 @@ export async function apply(ctx, config) {
   // PTT_TTS 未显式设置（空/未设）→ 智能探测可用合成器：①openai(调接口查模型) ②macOS say ③none
   // 先于 OUTPUT_AUDIO=auto 判断，因为 auto 要看 PTT_TTS 是否 openai
   if (!process.env.PTT_TTS) {
-    env.PTT_TTS = await detectBestTts(env, cfg);
+    // OUTPUT_AUDIO 显式为 say（macOS）→ 直接用 say 读文字，无需独立 TTS → none
+    if (process.env.PTT_OUTPUT_AUDIO === 'say') {
+      let hasSay = false;
+      try { execFileSync('which', ['say'], { stdio: 'ignore' }); hasSay = process.platform === 'darwin'; } catch {}
+      env.PTT_TTS = hasSay ? 'none' : await detectBestTts(env, cfg);
+    } else {
+      env.PTT_TTS = await detectBestTts(env, cfg);
+    }
   }
-  // PTT_OUTPUT_AUDIO=auto：有 macOS say，或已配 openai TTS 且有本地播放器 → say；否则 none
+  // PTT_OUTPUT_AUDIO=auto：根据已解析的 PTT_TTS 决定实际输出方式
+  //   PTT_TTS=say(macOS) → say（本地 say 合成+播）
+  //   PTT_TTS=openai      → 本地播放器命令（afplay/aplay/paplay/ffplay，openai 合成 wav 后播放）
+  //   否则                → none
   if (env.PTT_OUTPUT_AUDIO === 'auto') {
-    let sayable = false;
+    let hasSay = false;
     try {
       execFileSync('which', ['say'], { stdio: 'ignore' });
-      sayable = process.platform === 'darwin';
+      hasSay = process.platform === 'darwin';
     } catch { /* 无 say */ }
-    // 无 macOS say 时：openai TTS + 本地播放器 → 仍可本地播（树莓派等 Linux 无 say 也能出声）
-    if (!sayable && env.PTT_TTS === 'openai' && (process.env.PTT_TTS_PLAYER || wavPlayer())) sayable = true;
-    env.PTT_OUTPUT_AUDIO = sayable ? 'say' : 'none';
+    let outmode = 'none';
+    if (env.PTT_TTS === 'say' && hasSay) outmode = 'say';
+    else if (env.PTT_TTS === 'openai') outmode = wavPlayer() || 'none';
+    env.PTT_OUTPUT_AUDIO = outmode;
   }
   // PTT_ASR 未显式设置（空/未设）→ 智能探测可用 ASR：①openai(调接口查模型) ②none
   if (!process.env.PTT_ASR) {
@@ -566,7 +576,6 @@ export async function apply(ctx, config) {
   cfg.PTT_TTS_MODEL = env.PTT_TTS_MODEL;
   cfg.PTT_TTS_KEY = env.PTT_TTS_KEY;
   cfg.PTT_TTS_VOICE = env.PTT_TTS_VOICE;
-  cfg.PTT_TTS_PLAYER = env.PTT_TTS_PLAYER;
   cfg.PTT_ASR = env.PTT_ASR;
   cfg.PTT_ASR_URL = env.PTT_ASR_URL;
   cfg.PTT_ASR_API = env.PTT_ASR_API;
@@ -595,13 +604,8 @@ export async function apply(ctx, config) {
   }, out);
   const { mode } = await manageSessions(ctx, bridge);
 
-  // 解析本地播放器：未指定则按 OS 探测，作为 PTT_TTS_PLAYER 的最终值打印（读取=xxx 最终=yyy）
-  const localPlayer = resolvePlayer(cfg);
-  cfg.LOCAL_PLAYER = localPlayer;
-  if (!env.PTT_TTS_PLAYER) {
-    env.PTT_TTS_PLAYER = localPlayer ?? '';
-    cfg.PTT_TTS_PLAYER = env.PTT_TTS_PLAYER;
-  }
+  // 本地播放器 = PTT_OUTPUT_AUDIO 的实际值（say=本地 say；其余=播放器命令如 aplay/afplay/ffplay）
+  cfg.LOCAL_PLAYER = cfg.OUTPUT_AUDIO;
 
   // 会话打印放最开头之后，再打印环境变量（读取值 + 最终值）
   // PTT_WS_URL + 3 个 input + 2 个 output 挪到最后打印（按 IO_ORDER），其余先打
@@ -935,6 +939,4 @@ export async function apply(ctx, config) {
 
   out.log('[ptt] 对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）');
   out.log(`[ptt] 输入: 音频=${cfg.INPUT_AUDIO} 文本=${cfg.INPUT_TEXT} 图片=${cfg.INPUT_IMAGE} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
-  // 本地播放器已在上方解析并写入 PTT_TTS_PLAYER 最终值；这里仅打印（取自缓存）
-  out.log(`[ptt] 🔊 本地播放器: ${cfg.LOCAL_PLAYER || '未找到（openai 语音无法本地播放；请设 PTT_TTS_PLAYER 或装 aplay/paplay/ffplay）'}`);
 }

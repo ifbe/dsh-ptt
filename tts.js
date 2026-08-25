@@ -6,29 +6,41 @@
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 
+/** 清洗待合成文本：换行/特殊标记符号(* # _ ` | ~ ^ \)/emoji → 空格，并合并多余空白。
+ *  omlx TTS 遇换行会切音色、遇符号/emoji 会乱读或无法播放，故统一替换成空格。 */
+export function cleanTtsText(text) {
+  return String(text)
+    .replace(/\r?\n+/g, ' ')
+    .replace(/[#*`_|~^\\]/g, ' ')
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{200D}\u{1F1E6}-\u{1F1FF}]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** macOS say -o 生成 wav 文件 */
 async function sayWav(text, cfg, out) {
-  out?.log?.(`[ptt] 🎤 TTS 合成中...（${text.length} 字）`);
-  const wavPath = `/tmp/dsh_ptt_tts_${Date.now()}.wav`;
+  const clean = cleanTtsText(text); // 换行/特殊标记符号/emoji → 空格，防乱读
+  out?.log?.(`[ptt] 🎤 TTS 合成中...（${clean.length} 字）`);
+  const wavPath = `/tmp/dsh_ptt_tts.wav`; // 固定名：每次合成都覆盖同一文件，不清理、不堆积
   await new Promise((resolve, reject) => {
-    const p = spawn('say', ['-v', cfg.VOICE_NAME, '-o', wavPath, '--data-format=LEI16@16000', text]);
+    const p = spawn('say', ['-v', cfg.VOICE_NAME, '-o', wavPath, '--data-format=LEI16@16000', clean]);
     p.on('error', reject);
     p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`say 退出码 ${code}`))));
   });
   const buf = fs.readFileSync(wavPath);
-  fs.rmSync(wavPath, { force: true });
   out?.log?.(`[ptt] 🎤 TTS 收到 wav（${buf.length} 字节）`);
   return buf;
 }
 
 /** openai：调 omlx /v1/audio/speech → wav 缓冲 */
 async function openaiWav(text, cfg, out) {
-  out?.log?.(`[ptt] 🎤 TTS 合成中...（${text.length} 字）`);
+  const input = cleanTtsText(text); // 换行/特殊标记符号/emoji → 空格，防乱读/切音色
+  out?.log?.(`[ptt] 🎤 TTS 合成中...（${input.length} 字）`);
   const baseUrl = (cfg.PTT_TTS_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
   const apiKey = cfg.PTT_TTS_KEY || cfg.OMLX_API_KEY || '';
   const model = cfg.PTT_TTS_MODEL || 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
   const voice = cfg.PTT_TTS_VOICE || 'alloy';
-  const body = JSON.stringify({ model, input: text, voice });
+  const body = JSON.stringify({ model, input, voice });
   const res = await fetch(`${baseUrl}/audio/speech`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -84,15 +96,14 @@ export function resolvePlayer(cfg) {
  * @param cfg
  */
 export function playWavBuffer(buf, cfg, out) {
-  const player = cfg.LOCAL_PLAYER ?? resolvePlayer(cfg);
-  if (!player) return '没有可用的本地播放器（afplay/aplay/paplay/ffplay）';
-  const wavPath = `/tmp/dsh_ptt_play_${Date.now()}.wav`;
+  const player = cfg.LOCAL_PLAYER; // = PTT_OUTPUT_AUDIO 的实际播放器（say/aplay/afplay/ffplay）
+  if (!player || player === 'ws' || player === 'none') return '没有可用的本地播放器';
+  const wavPath = `/tmp/dsh_ptt_play.wav`; // 固定名：每次都覆盖同一文件，不清理、不堆积
   fs.writeFileSync(wavPath, buf);
   out?.log?.(`[ptt] 🔊 播放命令: ${player} ${wavPath}`);
   return new Promise((resolve) => {
     const p = spawn(player, [wavPath], { stdio: 'ignore' });
-    const cleanup = () => { try { fs.rmSync(wavPath, { force: true }); } catch { /* ignore */ } };
-    p.on('error', (e) => { cleanup(); resolve(`播放器启动失败（${e?.message ?? e}）`); });
-    p.on('exit', (code) => { cleanup(); resolve(code === 0 ? null : `播放器退出码 ${code}`); });
+    p.on('error', (e) => resolve(`播放器启动失败（${e?.message ?? e}）`));
+    p.on('exit', (code) => resolve(code === 0 ? null : `播放器退出码 ${code}`));
   });
 }

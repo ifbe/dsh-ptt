@@ -7,7 +7,7 @@
 //
 // 所有 stdout 输出走统一队列（_write），避免流式 chunk 与日志/工具打印交错。
 import { spawn } from 'node:child_process';
-import { ttsWav, playWavBuffer } from './tts.js';
+import { ttsWav, playWavBuffer, cleanTtsText } from './tts.js';
 
 /** 从消息 content 数组提取文本（递归处理 tool-result） */
 function extractText(content) {
@@ -154,15 +154,7 @@ export class Speaker {
       if (text || thinkText) {
         // 文本输出回调：think 与 reply 分开传（ws 广播可标不同标签）
         this.onReply?.({ think: thinkText, reply: text });
-        if (this.config.OUTPUT_AUDIO === 'ws') {
-          // ws 输出：完整播报，不截断（客户端自己处理）
-          this.say(text);
-        } else if (text.length > 100) {
-          // 本地 say：前 100 字正常念，第 101 起省略并提示总字数
-          this.say(`${text.slice(0, 100)}……模型总共回复了 ${text.length} 个字`);
-        } else {
-          this.say(text);
-        }
+        this.say(text); // 完整播报（不再做超 100 字只读前 100 字+显示字数的截断）
       }
       this._write(`[ptt] 📡 turn/end: ${JSON.stringify(evt.data?.reason ?? {}).slice(0, 120)}\n`);
       const reason = evt.data?.reason;
@@ -175,7 +167,8 @@ export class Speaker {
 
   /** 语音播报：入队串行播放（不并发不丢弃）。TTS 不可用时打印报错、不崩溃。 */
   say(text) {
-    if (this.config.PTT_TTS === 'none') {
+    // PTT_TTS=none 但输出方式是本地 say（OUTPUT_AUDIO=say，macOS）→ 直接用 say 读文字，无需独立 TTS
+    if (this.config.PTT_TTS === 'none' && this.config.OUTPUT_AUDIO !== 'say') {
       this.out.error('[ptt] ⚠️ 无有效TTS工具（PTT_TTS=none），播放语音失败，已跳过');
       return;
     }
@@ -206,9 +199,10 @@ export class Speaker {
       if (perr) this.out.error(`[ptt] ❌ 本地播放失败: ${perr}`);
       return;
     }
-    // say（macOS 本地直接播）
+    // say（macOS 本地直接播）——先用 cleanTtsText 清洗（换行/特殊符号/emoji → 空格）
+    const clean = cleanTtsText(text);
     await new Promise((resolve) => {
-      const p = spawn('say', ['-v', cfg.VOICE_NAME, text], { stdio: 'ignore' });
+      const p = spawn('say', ['-v', cfg.VOICE_NAME, clean], { stdio: 'ignore' });
       p.on('error', (e) => { this.out.error(`[ptt] ❌ 语音播报失败（say 不可用）: ${e?.message ?? e}`); resolve(); });
       p.on('exit', resolve);
     });
