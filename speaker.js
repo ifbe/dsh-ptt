@@ -7,7 +7,7 @@
 //
 // 所有 stdout 输出走统一队列（_write），避免流式 chunk 与日志/工具打印交错。
 import { spawn } from 'node:child_process';
-import { ttsWav, playWavBuffer, cleanTtsText } from './tts.js';
+import { ttsWav, playWavBuffer, playWavFile, synthesizeSplit, cleanTtsText } from './tts.js';
 
 /** 从消息 content 数组提取文本（递归处理 tool-result） */
 function extractText(content) {
@@ -193,6 +193,15 @@ export class Speaker {
   async _playOne(text) {
     const cfg = this.config;
     if (cfg.PTT_TTS === 'openai') {
+      // 设了 PTT_TTS_MAXSIZE → 切块合成到分片文件，依次本地播放
+      if (Number(cfg.PTT_TTS_MAXSIZE || 0) > 0) {
+        const paths = await synthesizeSplit(text, cfg, this.out);
+        for (const p of paths) {
+          const perr = await playWavFile(p, cfg, this.out);
+          if (perr) this.out.error(`[ptt] ❌ 本地播放失败: ${perr}`);
+        }
+        return;
+      }
       const r = await ttsWav(text, cfg, this.out);
       if (r.error) { this.out.error(`[ptt] ❌ 语音生成失败: ${r.error}`); return; }
       const perr = await playWavBuffer(r.wav, cfg, this.out);

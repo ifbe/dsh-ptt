@@ -79,6 +79,7 @@ dsh --profile ptt
 | `PTT_TTS_MODEL` | model | Qwen3-TTS-12Hz-0.6B-Base-4bit | openai TTS 模型 |
 | `PTT_TTS_KEY` | key | OMLX_API_KEY | openai TTS key |
 | `PTT_TTS_VOICE` | voice | alloy | openai TTS 音色 |
+| `PTT_TTS_MAXSIZE` | num | 空 | 单次 TTS 最大字数；设了则按句末切块（换行>句号>其他符号，无则硬切，最多 50 块），本地依次播、ws 用 ffmpeg `-c copy` 合并一次发；空=不分 |
 | `PTT_ASR` | openai / none | 自动探测 | ASR 方式；未设置时按 ①openai(调 /v1/models 查模型) ②none 自动选 |
 | `PTT_ASR_URL` | url | OMLX_BASE_URL | ASR 端点 |
 | `PTT_ASR_API` | transcribe | transcribe | ASR 接口路径 |

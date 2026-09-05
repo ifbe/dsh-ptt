@@ -15,7 +15,7 @@ const out = createOutputQueue();
 import { transcribe } from './asr.js';
 import { SessionBridge, manageSessions } from './session.js';
 import { Speaker } from './speaker.js';
-import { ttsWav, wavPlayer } from './tts.js';
+import { ttsWav, wavPlayer, synthesizeSplit, mergeTtsWavs } from './tts.js';
 
 export const name = 'ptt';
 export const inject = ['agents', 'credentials', 'llm', 'agentDefaultModel', 'commands', 'sessionPersistence'];
@@ -502,6 +502,7 @@ export async function apply(ctx, config) {
     PTT_TTS_MODEL: '',             // openai TTS 模型名（默认 Qwen3-TTS-12Hz-0.6B-Base-4bit）
     PTT_TTS_KEY: '',               // openai TTS key（默认用 OMLX_API_KEY）
     PTT_TTS_VOICE: 'alloy',        // openai TTS 音色
+    PTT_TTS_MAXSIZE: '',           // 单次 TTS 最大字数；设了则按句末切块（服务器超时用），空=不分
     PTT_ASR: 'openai',             // ASR 方式：openai(OpenAI 兼容) | none
     PTT_ASR_URL: '',               // ASR 端点（默认用 OMLX_BASE_URL）
     PTT_ASR_API: 'transcribe',     // ASR API 路径（transcribe = /audio/transcriptions）
@@ -576,6 +577,7 @@ export async function apply(ctx, config) {
   cfg.PTT_TTS_MODEL = env.PTT_TTS_MODEL;
   cfg.PTT_TTS_KEY = env.PTT_TTS_KEY;
   cfg.PTT_TTS_VOICE = env.PTT_TTS_VOICE;
+  cfg.PTT_TTS_MAXSIZE = env.PTT_TTS_MAXSIZE;
   cfg.PTT_ASR = env.PTT_ASR;
   cfg.PTT_ASR_URL = env.PTT_ASR_URL;
   cfg.PTT_ASR_API = env.PTT_ASR_API;
@@ -911,6 +913,25 @@ export async function apply(ctx, config) {
       // TTS 不可用（PTT_TTS=none）→ 打印报错、不生成 wav、不崩溃
       if (cfg.PTT_TTS === 'none') {
         out.error('[ptt] ⚠️ 无有效TTS工具（PTT_TTS=none），发送wav给ws失败，已跳过语音');
+        return;
+      }
+      // 设了 PTT_TTS_MAXSIZE → 切块合成到分片文件，ffmpeg 合并后一次性广播
+      if (Number(cfg.PTT_TTS_MAXSIZE || 0) > 0) {
+        const paths = await synthesizeSplit(text, cfg, out);
+        if (paths.length === 0) { out.error('[ptt] ❌ TTS 未生成音频，无法发送给 ws'); return; }
+        if (paths.length === 1) {
+          wsChannel.broadcastAudio(fs.readFileSync(paths[0]));
+          return;
+        }
+        const merged = await mergeTtsWavs(paths, out);
+        if (merged.wav) {
+          wsChannel.broadcastAudio(merged.wav); // 有 ffmpeg → 合并成一次发
+        } else if (merged.error === 'NO_FFMPEG') {
+          // 无 ffmpeg → 依次把每个分片 wav 发过去（网页逐个播报）
+          for (const p of paths) wsChannel.broadcastAudio(fs.readFileSync(p));
+        } else {
+          out.error(`[ptt] ❌ 合并失败，发送wav给ws失败: ${merged.error}`);
+        }
         return;
       }
       // ttsWav 按 PTT_TTS 生成 wav（openai→omlx / say→macOS say -o）
