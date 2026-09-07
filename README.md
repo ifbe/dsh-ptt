@@ -11,6 +11,16 @@
 dsh --profile ptt
 ```
 
+### 功能1b：语音 VAD 触发（免手柄）
+
+`PTT_INPUT_AUDIO=vad`：无需手柄，直接对着麦克风说话，`vad.py`（麦克风 + `webrtcvad` 状态机）检测到语音段后自动录音 → ASR。
+- **方向靠触发词**：`你好`/`hello` 开头 → 正常对话；`命令`/`command` 开头 → 语音命令（如 `命令停止`→`/stop`）；**否则丢弃**（防误触发）。
+- 阈值（VAD 力度 / 起止帧数 / 最小时长）写死在 `vad.py` 顶部，改着试验。
+- 需要额外 `webrtcvad`（`pip install webrtcvad`；Raspberry Pi 用 `apt install python3-webrtcvad`）。
+```bash
+PTT_INPUT_AUDIO=vad dsh --profile ptt
+```
+
 ## 功能2：ws 对讲机（带 Web 界面）
 
 纯 ws 双向通道（文本 / 命令 / 图片 / wav），并附带一个**浏览器测试页**。无需手柄/麦克风权限。
@@ -67,7 +77,7 @@ dsh --profile ptt
 
 | 变量 | 可选值 | 默认 | 说明 |
 |---|---|---|---|
-| `PTT_INPUT_AUDIO` | gamepad / mic / ws / none | gamepad | 音频来源（功能1=gamepad，功能2=ws，功能3=none） |
+| `PTT_INPUT_AUDIO` | gamepad / vad / mic / ws / none | gamepad | 音频来源（功能1=gamepad 手柄；vad=语音VAD自动触发；功能2=ws；功能3=none） |
 | `PTT_INPUT_TEXT` | stdin / ws / none | stdin | 文本来源 |
 | `PTT_INPUT_IMAGE` | ws / none | none | ws 图片输入（与音频独立） |
 | `PTT_OUTPUT_TEXT` | stdout / ws / none | stdout | 文本输出 |
@@ -94,6 +104,7 @@ dsh --profile ptt
 ```
 
 - **功能1（手柄）**还需 Python 依赖：`pip install pygame sounddevice numpy`（或 `pyaudio`）。推荐 Python **3.12**（3.10~3.13 均可；勿用 3.14 + pygame 2.6.1，会间歇崩溃）
+- **功能1（语音 VAD）**另需 `webrtcvad`（`pip install webrtcvad`，C 扩展，macOS 可能要现场编译；Raspberry Pi 用 `apt install python3-webrtcvad`）。麦克风采集用 `sounddevice`
 - LLM/ASR 模型通过 `settings.yaml` 的 `llm-pi-ai.providers.omlx` 配置，插件在 `cordis.patch.yml` 指定 `LLM_PROVIDER`/`LLM_MODEL`
 
 ## License

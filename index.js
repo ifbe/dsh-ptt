@@ -6,7 +6,7 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import readline from 'node:readline';
-import { startGamepad } from './gamepad.js';
+import { startGamepad, startVad } from './audio.js';
 import { startWs } from './ws.js';
 import { createOutputQueue } from './out.js';
 
@@ -492,7 +492,7 @@ export async function apply(ctx, config) {
   // ── 环境变量（PTT_ 前缀防冲突，export 提供；未设则用默认）──
   const ENV_DEFAULTS = {
     PTT_INPUT_TEXT: 'stdin',       // 文本输入：stdin(回车一行) | ws | none
-    PTT_INPUT_AUDIO: 'gamepad',    // 音频输入：gamepad(手柄+录音,gamepad.py) | mic(纯麦克风) | ws | none
+    PTT_INPUT_AUDIO: 'gamepad',    // 音频输入：gamepad(手柄+录音,gamepad.py) | vad(语音VAD,vad.py) | mic(纯麦克风,占位) | ws | none
     PTT_OUTPUT_TEXT: 'stdout',     // 文本输出：stdout(终端) | ws | none
     PTT_OUTPUT_AUDIO: 'auto',      // 语音输出：say(macOS) | ws | none；auto=自动检测（macOS+有say才say，否则none）
     PTT_MODEL: '',                 // LLM 模型 provider/model（如 omlx/Qwen3.6-35B-A3B-4bit），空=用配置
@@ -655,12 +655,53 @@ export async function apply(ctx, config) {
     }
   };
 
+  // 读取 wav 的时长(sec)与文件字节数，用于 ASR 日志
+  const wavInfo = (wavPath) => {
+    try {
+      const bytes = fs.statSync(wavPath).size;
+      const buf = fs.readFileSync(wavPath);
+      let off = 12, rate = 16000, channels = 1, bits = 16, dataSize = 0;
+      while (off + 8 <= buf.length) {
+        const id = buf.toString('ascii', off, off + 4);
+        const sz = buf.readUInt32LE(off + 4);
+        if (id === 'fmt ') {
+          channels = buf.readUInt16LE(off + 10);
+          rate = buf.readUInt32LE(off + 12);
+          bits = buf.readUInt16LE(off + 22);
+        } else if (id === 'data') {
+          dataSize = sz;
+        }
+        off += 8 + sz + (sz % 2); // chunk 4 字节对齐
+      }
+      const byteRate = rate * channels * (bits / 8);
+      const sec = byteRate > 0 ? dataSize / byteRate : 0;
+      return { sec, bytes };
+    } catch {
+      return { sec: 0, bytes: 0 };
+    }
+  };
+
+  // ASR 流水号：每次识别取一个号，开始/成功/失败都用同一号（方便排查）
+  let asrSeq = 0;
+  const doAsr = async (wav) => {
+    const seq = ++asrSeq;
+    const info = wavInfo(wav);
+    out.log(`[ptt] 🎯 ASR #${seq} 识别中 ${info.sec.toFixed(3)}s ${info.bytes}byte`);
+    try {
+      const text = await transcribe(wav, cfg);
+      out.log(`[ptt] 📝 ASR #${seq}: ${text}`);
+      return text;
+    } catch (err) {
+      out.error(`[ptt] ❌ ASR #${seq} 失败: ${err?.message ?? err}`);
+      return '';
+    }
+  };
+
   // 通用：wav → ASR → 正常对话（不做 runOnce，由事件入口统一串行）
   const handleWavInput = async (wav) => {
     if (!wav) return;
-    out.log('[ptt] 🎯 ASR 识别中...');
-    const text = await transcribe(wav, cfg);
-    out.log(`[ptt] 📝 ASR: ${text}`);
+    const text = await doAsr(wav);
+    if (!text) return; // ASR 失败/空 → 忽略
     if (cfg.ASR_DEBUG) {
       out.log('[ptt] 🔧 调试模式：结果未发给模型');
       return;
@@ -671,9 +712,8 @@ export async function apply(ctx, config) {
   // 通用：wav → ASR → 语音命令（B键逻辑，不做 runOnce）
   const handleWavCommand = async (wav) => {
     if (!wav) return;
-    out.log('[ptt] 🎯 ASR 识别中...');
-    const text = await transcribe(wav, cfg);
-    out.log(`[ptt] 📝 ASR: ${text}`);
+    const text = await doAsr(wav);
+    if (!text) return; // ASR 失败/空 → 忽略
     if (cfg.ASR_DEBUG) {
       out.log('[ptt] 🔧 调试模式：未执行命令');
       return;
@@ -781,9 +821,7 @@ export async function apply(ctx, config) {
       if (!wav) {
         return;
       }
-      out.log('[ptt] 🎯 ASR 识别中...');
-      const text = await transcribe(wav, cfg);
-      out.log(`[ptt] 📝 ASR: ${text}`);
+      const text = await doAsr(wav);
       if (cfg.ASR_DEBUG) {
         out.log('[ptt] 🔧 调试模式：结果未发给模型');
         return;
@@ -800,9 +838,8 @@ export async function apply(ctx, config) {
       if (!wav) {
         return;
       }
-      out.log('[ptt] 🎯 ASR 识别中...');
-      const text = await transcribe(wav, cfg);
-      out.log(`[ptt] 📝 ASR: ${text}`);
+      const text = await doAsr(wav);
+      if (!text) return; // ASR 失败/空 → 忽略
       if (cfg.ASR_DEBUG) {
         out.log('[ptt] 🔧 调试模式：未执行命令');
         return;
@@ -810,16 +847,59 @@ export async function apply(ctx, config) {
       await handleCommand(text);
     });
 
-  // ── 输入装配：按钮（手柄）+ 音频（mic/ws）+ ws ──
-  let gamepad = { ready: new Promise(() => {}), dispose() {} }; // 未启用时 ready 永不 settle
+  // ── 输入装配：按钮（手柄）/ 语音(VAD) + 音频（mic/ws）+ ws ──
+  // VAD 语音段：ASR → 前缀触发词路由/过滤。仅 VAD 路径生效；gamepad A/B 不受影响。
+  //   命令：以 命令/command 开头 → 语音命令（如 命令停止 → /stop）
+  //   对话：以 你好/hello 开头 → 正常对话；否则丢弃（防误触发）
+  const onVadUtterance = (wav) =>
+    runOnce(async () => {
+      if (!wav) return;
+      const text = await doAsr(wav);
+      if (!text) return; // ASR 失败/空 → 忽略
+      if (cfg.ASR_DEBUG) {
+        out.log('[ptt] 🔧 调试模式：结果未发给模型');
+        return;
+      }
+      const trimmed = String(text).trim();
+      // 1) 命令/command 开头 → 语音命令
+      if (/^(命令|command)/i.test(trimmed)) {
+        await handleCommand(trimmed);
+        return;
+      }
+      // 2) 你好/hello 开头 → 正常对话
+      if (/^(你好|hello)/i.test(trimmed)) {
+        await handleTextInput(trimmed);
+        return;
+      }
+      // 3) 否则丢弃（需触发词，防误触发）
+      out.log(`[ptt] 🚫 无触发词（需要 你好/hello 或 命令/command），丢弃`);
+    });
+
+  let audio = { ready: new Promise(() => {}), dispose() {} }; // 未启用时 ready 永不 settle
   if (cfg.INPUT_AUDIO === 'gamepad') {
     // gamepad.py 套件：手柄 A/B 键 + 麦克风录音（原先那套）
-    gamepad = startGamepad(
+    audio = startGamepad(
       {
         onTalkDown: () => out.log('[ptt] 录音中（a键）'),
         onTalkUp,
         onCmdDown: () => out.log('[ptt] 录音中（b键）'),
         onCmdUp,
+        onError: (msg) => logger.error?.(`[ptt] ${msg}`),
+      },
+      cfg,
+      logger,
+    );
+  } else if (cfg.INPUT_AUDIO === 'vad') {
+    // vad.py：麦克风 + webrtcvad 状态机，检测到语音段 → 自动录音 → wav
+    audio = startVad(
+      {
+        onTalkDown: () => out.log('[ptt] 🎤 检测到语音，开始录音'),
+        // 📦 立即打印（不受 runOnce/ASR 慢影响），ASR+路由再走串行的 onVadUtterance
+        onTalkUp: (wav) => {
+          if (wav) out.log(`[ptt] 📦 录音完成（vad，${wav}）`);
+          onVadUtterance(wav);
+        },
+        onDrop: (info) => out.log(`[ptt] ⏱️ 语音过短丢弃（${info?.duration_ms ?? '?'}ms）`),
         onError: (msg) => logger.error?.(`[ptt] ${msg}`),
       },
       cfg,
@@ -948,16 +1028,19 @@ export async function apply(ctx, config) {
 
   // 生命周期：退出时清理
   ctx.effect(() => {
-    gamepad.ready.catch((err) => {
+    audio.ready.catch((err) => {
       out.error(`[ptt] ❌ ${err?.message ?? err}`);
     });
     return () => {
-      gamepad.dispose();
+      audio.dispose();
       wsChannel.dispose();
       stdinRl?.close();
     };
   });
 
-  out.log('[ptt] 对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）');
+  const ioHint = cfg.INPUT_AUDIO === 'vad'
+    ? '对讲机就绪：说话触发（你好/hello=对话；命令/command 开头=语音命令，如 命令停止→/stop）'
+    : '对讲机就绪：A键=按住说话，B键=按住说命令（stop/reset）';
+  out.log(`[ptt] ${ioHint}`);
   out.log(`[ptt] 输入: 音频=${cfg.INPUT_AUDIO} 文本=${cfg.INPUT_TEXT} 图片=${cfg.INPUT_IMAGE} | 输出: 文本=${cfg.OUTPUT_TEXT} 语音=${cfg.OUTPUT_AUDIO}`);
 }

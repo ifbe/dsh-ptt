@@ -1,8 +1,12 @@
-// 手柄事件源（双后端）：
-//   1. node-hid（默认）：直接读游戏手柄 HID 报告，绕开 pygame/SDL 事件层
-//      （SDL 对 PS4 手柄在 macOS 上有 event.get() 崩溃 bug）
-//   2. pygame 桥（兜底）：spawn bridge.py，逻辑与 ~/test.py 一致
-// 输出统一语义事件：talk_down/talk_up/cmd_down/cmd_up
+// 音频输入源（按 PTT_INPUT_AUDIO 分发）：
+//   startGamepad —— 手柄 B/A 键手势事件源（双后端）：
+//     1. node-hid（默认）：直接读游戏手柄 HID 报告，绕开 pygame/SDL 事件层
+//        （SDL 对 PS4 手柄在 macOS 上有 event.get() 崩溃 bug）
+//     2. pygame 桥（兜底）：spawn gamepad.py，逻辑与 ~/test.py 一致
+//   startVad —— 纯语音触发（VAD）：spawn vad.py，麦克风 + webrtcvad 状态机
+//      检测到语音段 → 录好完整 wav → {"e":"talk_up","wav":"/tmp/..."} 交给 node
+// 输出统一语义事件：talk_down/talk_up/cmd_down/cmd_up（gamepad）
+//                          talk_down/talk_up/drop（vad）
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -189,4 +193,83 @@ export function startGamepad(handlers, config) {
     }
   }
   return startPyBridge(handlers, config);
+}
+
+// ────────────────────────── VAD 语音触发（vad.py）──────────────────────────
+/**
+ * 纯语音触发：spawn vad.py（麦克风 + webrtcvad 状态机）。
+ * py 自闭环：采麦克风 → 判语音开始/结束 → 段结束录好完整 wav → emit。
+ * node 只被动收事件，控制权全在 py。
+ * vad.py 输出 JSON 行：{"e":"status|ready|talk_down|talk_up|drop|error",...}
+ * @param {object} handlers {onTalkDown,onTalkUp,onDrop,onReady,onError}
+ * @param {object} config
+ * @returns {{dispose():void, ready: Promise<void>}}
+ */
+export function startVad(handlers, config) {
+  const pythonBin = config.PYTHON_BIN ?? 'python3';
+  const proc = spawn(pythonBin, [path.join(here, 'vad.py')], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+  });
+  const rl = readline.createInterface({ input: proc.stdout });
+
+  let readyResolve;
+  let readyReject;
+  const ready = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  proc.on('error', (err) => readyReject(err));
+  proc.on('exit', (code) => readyReject(new Error(`vad bridge exited: ${code}`)));
+
+  rl.on('line', (line) => {
+    let evt;
+    try {
+      evt = JSON.parse(line);
+    } catch {
+      console.warn(`[ptt] bad vad line: ${line}`);
+      return;
+    }
+    switch (evt.e) {
+      case 'status':
+        if (evt.msg === 'listening') {
+          console.log('[ptt] 🎙️ VAD 监听中（麦克风）...');
+          readyResolve?.(evt);
+        }
+        break;
+      case 'ready':
+        readyResolve?.(evt);
+        handlers.onReady?.(evt);
+        break;
+      case 'talk_down':
+        handlers.onTalkDown?.();
+        break;
+      case 'talk_up':
+        handlers.onTalkUp?.(evt.wav ?? null);
+        break;
+      case 'drop':
+        handlers.onDrop?.(evt);
+        break;
+      case 'error':
+        console.error(`[ptt] VAD 错误: ${evt.msg}`);
+        handlers.onError?.(evt.msg);
+        break;
+      default:
+        console.log(`[ptt] vad: ${line}`);
+    }
+  });
+
+  return {
+    ready,
+    dispose() {
+      rl.close();
+      proc.kill('SIGTERM');
+      // 保险：声卡线程/循环可能吞掉 SIGTERM，2 秒后强制结束
+      setTimeout(() => {
+        try {
+          proc.kill('SIGKILL');
+        } catch { /* ignore */ }
+      }, 2000).unref?.();
+    },
+  };
 }

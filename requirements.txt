@@ -2,5 +2,6 @@
 pygame>=2.5.2
 sounddevice>=0.4
 numpy>=1.24
+webrtcvad>=0.1.3   # VAD(input_audio=vad) 用；C 扩展，Mac 上可能要 pip install 编一下（用户自行装）
 # 可选：有 pyaudio 时优先使用（需系统 PortAudio）
 # pyaudio
