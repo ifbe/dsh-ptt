@@ -632,6 +632,8 @@ export async function apply(ctx, config) {
   // 模型回复：流式打印 + turn/end 播报
   // 注意：session/event 是 (subject, event) 双参数，event 才是 {type, data}
   ctx.on('session/event', (subject, event) => speaker.handleEvent(event));
+  // session v2：assistant 流不再走 assistant/chunk 事件，改为 agent/assistant-stream 实时帧
+  ctx.on('agent/assistant-stream', ({ frame }) => speaker.handleStreamFrame(frame));
 
   // 单次「录音 → ASR → 处理」流程
   let chain = Promise.resolve();

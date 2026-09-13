@@ -1,6 +1,10 @@
 // 输出：把 DSH 的 session/event（assistant/chunk 流式文本）打印到终端，
 // turn/end 时整段用 macOS `say` 播报。事件结构对齐 qqbot 的 events.js。
 //
+// ⚠️ session 格式 v2（dsh 新版）：顶层 `assistant/chunk` 事件已移除，assistant 流改为
+//   实时帧 `agent/assistant-stream`（{frame:{type:'chunk',chunk}}）下发，并把流嵌入
+//   `assistant/message`。故文本累积走 handleStreamFrame；turn/end 仍由 session/event 触发播报。
+//
 // DSH 的 chunk 流没有 <think> 标签，用结构化块：
 //   - reasoning-delta：think/思考内容 → 终端置灰显示（💭 开头），不播报
 //   - text-delta：正常回复 → 终端正常显示，turn/end 播报
@@ -118,28 +122,8 @@ export class Speaker {
       return;
     }
     if (evt.type === 'assistant/chunk') {
-      const chunk = evt.data?.chunk;
-      // （切换打印统一在 handleEvent 入口处理）
-      if (chunk?.type === 'reasoning-delta' && chunk.text) {
-        // think：💭 emoji 开头（块内只一次）+ 灰色内容（不进入播报）
-        this.pendingReasoning += chunk.text;
-        if (this.config.OUTPUT_TEXT !== 'none') {
-          if (!this.inReasoning) {
-            this._write(`${ANSI_GRAY}💭 `);
-            this.inReasoning = true;
-            // 模型 reasoning 内容以 \n 开头，块首去掉（否则 💭 后看起来强制换行）
-            const t = chunk.text.replace(/^\n+/, '');
-            if (t) this._write(`${ANSI_GRAY}${t}${ANSI_RESET}`);
-          } else {
-            this._write(`${ANSI_GRAY}${chunk.text}${ANSI_RESET}`);
-          }
-        }
-      } else if (chunk?.type === 'text-delta' && chunk.text) {
-        // 正常回复：正常颜色显示 + 累积待播报
-        this.inReasoning = false;
-        this.pending += chunk.text;
-        if (this.config.OUTPUT_TEXT !== 'none') this._write(chunk.text);
-      }
+      // 旧版（session v1）流式事件；v2 已移除，改用 agent/assistant-stream 帧
+      this._handleDelta(evt.data?.chunk);
       return;
     }
     if (evt.type === 'turn/end') {
@@ -162,6 +146,44 @@ export class Speaker {
         const detail = reason.error ?? reason.failure;
         this._write(`\n[ptt] turn error: ${detail?.message ?? 'unknown'}\n`);
       }
+    }
+  }
+
+  /** 处理 v2 实时流帧（agent/assistant-stream）：chunk 帧含 text-delta/reasoning-delta */
+  handleStreamFrame(frame) {
+    if (!frame) return;
+    if (frame.type === 'chunk' && frame.chunk) {
+      const smallType = frame.chunk.type ?? '';
+      if (smallType && smallType !== this._lastChunkType) {
+        this._lastChunkType = smallType;
+        this._write(`[ptt] 📡 stream: chunk.type=${smallType}\n`);
+      }
+      this._handleDelta(frame.chunk);
+    }
+    // start/end 帧不处理：播报仍由 session/event 的 turn/end 触发
+  }
+
+  /** 处理一个流式 chunk（text-delta 累积播报；reasoning-delta 置灰不播报） */
+  _handleDelta(chunk) {
+    if (chunk?.type === 'reasoning-delta' && chunk.text) {
+      // think：💭 emoji 开头（块内只一次）+ 灰色内容（不进入播报）
+      this.pendingReasoning += chunk.text;
+      if (this.config.OUTPUT_TEXT !== 'none') {
+        if (!this.inReasoning) {
+          this._write(`${ANSI_GRAY}💭 `);
+          this.inReasoning = true;
+          // 模型 reasoning 内容以 \n 开头，块首去掉（否则 💭 后看起来强制换行）
+          const t = chunk.text.replace(/^\n+/, '');
+          if (t) this._write(`${ANSI_GRAY}${t}${ANSI_RESET}`);
+        } else {
+          this._write(`${ANSI_GRAY}${chunk.text}${ANSI_RESET}`);
+        }
+      }
+    } else if (chunk?.type === 'text-delta' && chunk.text) {
+      // 正常回复：正常颜色显示 + 累积待播报
+      this.inReasoning = false;
+      this.pending += chunk.text;
+      if (this.config.OUTPUT_TEXT !== 'none') this._write(chunk.text);
     }
   }
 
