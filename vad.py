@@ -15,6 +15,7 @@ import queue
 import sys
 import types
 import wave
+from collections import deque
 
 
 def _die(msg):
@@ -56,6 +57,8 @@ BLOCK_DURATION_MS = 20     # 底层帧长：webrtcvad 只支持 10/20/30ms（16k
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_DURATION_MS / 1000)  # 320
 VAD_LEVEL = 2              # webrtcvad.Vad(0-3)，越大越严格（2 常用）
 START_THRESHOLD_FRAMES = 8  # 连续 N 帧有声音 → 认为开始说话（8×20ms=160ms）
+PRE_ROLL_FRAMES = START_THRESHOLD_FRAMES + 5  # IDLE 滚动保留最近 N 帧（触发帧数+5，≈260ms），
+                            # 触发时作为 wav 开头，补回「连续第 N 帧才开始录」丢掉的开头（防吞首字/起音）
 END_THRESHOLD_FRAMES = 25   # 连续 N 帧无声音 → 认为说话结束（25×20ms=500ms，容纳句内停顿）
 MIN_DURATION_MS = 600       # 低于此长度的语音段丢弃（防杂音误发）
 MAX_DURATION_MS = 60000     # 超过强制结束（防异常长段撑爆内存/误发），默认 60s
@@ -78,6 +81,7 @@ def main():
 
     state = "IDLE"            # IDLE=待机 / SPEAKING=说话中
     audio_buffer = []
+    pre_roll = deque(maxlen=PRE_ROLL_FRAMES)  # IDLE 滚动缓冲：保留触发前最近 N 帧
     consecutive_speech = 0
     consecutive_silence = 0
     speech_start_frame = 0
@@ -105,15 +109,17 @@ def main():
                     continue
                 frame_counter += 1
 
-                # ── IDLE：连续有声音 → 开始 ──
+                # ── IDLE：滚动留 pre-roll；连续有声音 → 开始 ──
                 if state == "IDLE":
+                    pre_roll.append(audio_block.copy())  # 始终保留最近 N 帧（含起音）
                     if is_speech:
                         consecutive_speech += 1
                         if consecutive_speech >= START_THRESHOLD_FRAMES:
                             state = "SPEAKING"
-                            speech_start_frame = frame_counter
+                            # 首包 = pre-roll（含触发前被丢掉的起音），而非只从第 N 帧开始
+                            audio_buffer = list(pre_roll)
+                            speech_start_frame = frame_counter - (len(pre_roll) - 1)
                             consecutive_silence = 0
-                            audio_buffer = [audio_block.copy()]
                             emit("talk_down")
                     else:
                         consecutive_speech = 0
@@ -131,6 +137,7 @@ def main():
                         state = "IDLE"
                         consecutive_speech = 0
                         consecutive_silence = 0
+                        pre_roll.clear()  # 清掉本段尾部，避免混进下一段开头
                         if duration_ms < MIN_DURATION_MS:
                             emit("drop", reason="too_short", duration_ms=duration_ms)
                         else:
