@@ -95,19 +95,35 @@ function sessionFacts(logPath) {
   return facts;
 }
 
-/** 完整格式（全部会话用）：uuid/time/model/dir/subagent/archived/empty/title */
+/** 完整格式（全部会话用，按 workspace 分组后打印，故不再重复 dir）
+ *  字段：uuid/time/model/subagent/archived/empty/title */
 function describeSessionFull(a, archived) {
   const h = a.header ?? a;
   const f = a.path ? sessionFacts(a.path) : { model: '?', title: '', empty: true };
   const subagent = h.origin === 'subagent' || (h.delegationDepth ?? 0) > 0;
-  return `uuid=${h.id} time=${fmtTime(h.createdAt)} model=${f.model} dir=${h.cwd ?? ''} subagent=${subagent ? 'true' : 'false'} archived=${archived ? 'true' : 'false'} empty=${f.empty ? 'true' : 'false'} title=${f.title}`;
+  return `uuid=${h.id} time=${fmtTime(h.createdAt)} model=${f.model} subagent=${subagent ? 'true' : 'false'} archived=${archived ? 'true' : 'false'} empty=${f.empty ? 'true' : 'false'} title=${f.title}`;
 }
 
-/** 简洁格式（排序列表用）：uuid/time/model/dir/title */
+/** 按 workspace(dir) 分组打印：`dir=... {` → 缩进会话行 → `}总共N个` */
+function printByWorkspace(items, lineOf) {
+  const groups = new Map(); // dir → 会话数组（按首次出现顺序）
+  for (const a of items) {
+    const dir = (a.header ?? a)?.cwd ?? '';
+    if (!groups.has(dir)) groups.set(dir, []);
+    groups.get(dir).push(a);
+  }
+  for (const [dir, list] of groups) {
+    console.log(`dir=${dir} {`);
+    for (const a of list) console.log('  ' + lineOf(a));
+    console.log(`}总共${list.length}个`);
+  }
+}
+
+/** 简洁格式（排序列表用，按 workspace 分组后打印，故不再重复 dir）：uuid/time/model/title */
 function describeSessionSimple(a) {
   const h = a.header ?? a;
   const f = a.path ? sessionFacts(a.path) : { model: '?', title: '' };
-  return `uuid=${h.id} time=${fmtTime(h.createdAt)} model=${f.model} dir=${h.cwd ?? ''} title=${f.title}`;
+  return `uuid=${h.id} time=${fmtTime(h.createdAt)} model=${f.model} title=${f.title}`;
 }
 
 /** 会话是否空白（无用户消息） */
@@ -148,17 +164,19 @@ export async function manageSessions(ctx, bridge) {
     archivedSet = new Set(ws.global?.archivedSessionIds ?? []);
   } catch { /* 读不到 → 全部未归档 */ }
 
-  // 1) 打印所有会话（完整格式）
-  console.log(`[ptt] 📋 全部会话（${artifacts.length} 个）:`);
-  for (const a of artifacts) console.log('   ' + describeSessionFull(a, archivedSet.has(a.header.id)));
+  // 1) 打印所有会话（完整格式，按 workspace 分组）——仅 VERBOSE 模式
+  if (bridge.config?.VERBOSE) {
+    console.log(`[ptt] 📋 全部会话（${artifacts.length} 个，按 workspace 分组）:`);
+    printByWorkspace(artifacts, (a) => describeSessionFull(a, archivedSet.has((a.header ?? a).id)));
+  }
 
   // 2) 排序（按创建时间倒序）后打印：过滤归档 + 子代理 + 空白会话
   const active = artifacts.filter(
     (a) => !archivedSet.has(a.header.id) && !isSubagent(a) && !isEmptySession(a),
   );
   const sorted = [...active].sort((a, b) => (b.header.createdAt ?? 0) - (a.header.createdAt ?? 0));
-  console.log(`[ptt] 📋 可用会话（按创建时间倒序，${sorted.length} 个）:`);
-  for (const a of sorted) console.log('   ' + describeSessionSimple(a));
+  console.log(`[ptt] 📋 可用会话（按创建时间倒序，${sorted.length} 个，按 workspace 分组）:`);
+  printByWorkspace(sorted, describeSessionSimple);
 
   // 3) 模式分支
   const im = detectImPlugin(ctx);
@@ -213,13 +231,16 @@ export class SessionBridge {
     this.imSession = session;
   }
 
-  /** omlx provider 是否已注册（网页端 Models 页管理） */
-  hasOmlx() {
+  /** 默认模型：插件配置 LLM_PROVIDER/LLM_MODEL 优先；其次 DSH 默认模型（agent-default-model） */
+  defaultModel() {
+    const p = this.config.LLM_PROVIDER;
+    const m = this.config.LLM_MODEL;
+    if (p && m) return { provider: p, model: m };
     try {
-      return this.llm.listProviders().some((p) => p.id === this.config.LLM_PROVIDER);
-    } catch {
-      return false;
-    }
+      const def = this.ctx.agentDefaultModel?.currentSelection?.();
+      if (def?.provider && def?.model) return { provider: def.provider, model: def.model };
+    } catch { /* 忽略 */ }
+    return null;
   }
 
   /** 从 agent 读取实际生效的模型描述（provider/model）
@@ -270,20 +291,13 @@ export class SessionBridge {
     }
   }
 
-  agentOptions() {
-    return {
-      provider: this.config.LLM_PROVIDER,
-      model: this.config.LLM_MODEL,
-    };
-  }
-
   async create(sessionId) {
-    // 优先用配置的 omlx provider；omlx 未注册时回退 DSH 默认模型（不传 agentOptions）
-    const useOmlx = this.hasOmlx();
+    // 用默认模型建会话（dsh 0.1.5 起 agent 必须带 provider/model）
+    const model = this.defaultModel();
     const record = await this.agents.create({
       sessionId,
       meta: { cwd: process.cwd() },
-      ...(useOmlx ? { agentOptions: this.agentOptions() } : {}),
+      ...(model ? { agentOptions: model } : {}),
     });
     console.log(`[ptt] 🆕 创建会话 ${sessionId.slice(0, 12)}…（模型: ${this.modelOf(record.agent)}）`);
     this.record = record;
@@ -291,7 +305,7 @@ export class SessionBridge {
     return record;
   }
 
-  /** 启动/首次：恢复会话（带历史），没有则创建。返回 {agent, handle} */
+  /** 启动/首次：优先恢复唯一 ptt 会话；优先用它自带的模型，否则用默认模型 */
   async ensure() {
     if (this.record) return this.record;
     // 辅助模式：不创建/恢复 ptt 会话，实时找 IM 会话；无会话返回 null
@@ -302,7 +316,7 @@ export class SessionBridge {
     }
     const sessionId = this.readStateId() ?? this.defaultSessionId();
     this.sessionId = sessionId;
-    // 先试 session-own：不传 agentOptions，看 agent 是否自带模型
+    // 1) 优先恢复该 ptt 会话：不传 agentOptions，先看会话是否自带模型
     let resumed = null;
     try {
       resumed = await this.agents.resume({ resumeSessionId: sessionId });
@@ -312,29 +326,29 @@ export class SessionBridge {
     if (resumed) {
       const opts = resumed.agent?.options;
       if (opts?.provider && opts?.model) {
-        // 会话自己带模型（session-own）→ 记住之前的选择
+        // 会话自带模型（session-own，如 /model 切换过的）→ 直接沿用
         this.record = resumed;
         this.writeStateId(sessionId);
         console.log(`[ptt] ♻️ 恢复会话: ${sessionId.slice(0, 12)}…（模型: ${this.modelOf(resumed.agent)}）`);
         return resumed;
       }
-      // DSH resume 不会自动恢复 agentOptions：agent 无模型则销毁，
-      // 改用当前配置的模型重新恢复（否则请求报 no provider/model）
-      console.log(`[ptt] ♻️ 会话 ${sessionId.slice(0, 12)}… 无自带模型，用当前配置覆盖`);
+      // 会话没带模型 → 销毁，改用默认模型重新恢复同一会话
+      console.log(`[ptt] ♻️ 会话 ${sessionId.slice(0, 12)}… 无自带模型，用默认模型覆盖`);
       await resumed.dispose().catch(() => {});
     }
+    // 2) 用默认模型恢复同一会话（保证 agent 一定有 provider/model）
+    const model = this.defaultModel();
     try {
-      const useOmlx = this.hasOmlx();
       const created = await this.agents.resume({
         resumeSessionId: sessionId,
-        ...(useOmlx ? { agentOptions: this.agentOptions() } : {}),
+        ...(model ? { agentOptions: model } : {}),
       });
       this.record = created;
       this.writeStateId(sessionId);
       console.log(`[ptt] ♻️ 恢复会话: ${sessionId.slice(0, 12)}…（模型: ${this.modelOf(created.agent)}）`);
       return created;
     } catch {
-      // 状态里的会话不可用（不存在/损坏）→ 用全新随机 id 重建，
+      // 3) 会话不可用（不存在/损坏）→ 用全新随机 id 重建，
       // 绝不能拿旧 id 再 create（会覆盖/破坏已有日志）
       const newId = randomUUID();
       const created = await this.create(newId);
@@ -428,7 +442,7 @@ export class SessionBridge {
       agentOptions: { provider: resolved.provider, model: resolved.model },
     });
     this.record = resumed;
-    // 让后续 ensure()/agentOptions() 也沿用新模型
+    // 让后续 ensure()/defaultModel() 也沿用新模型
     this.config.LLM_PROVIDER = resolved.provider;
     this.config.LLM_MODEL = resolved.model;
     return { ok: true, model: `${resolved.provider}/${resolved.model}` };
@@ -464,6 +478,11 @@ export class SessionBridge {
     const before = rec.agent.session.header.cwd ?? process.cwd();
     const newId = randomUUID();
     if (this.record) await this.record.dispose().catch(() => {});
+    // fork 后沿用当前会话的模型（session-own），没有则用默认模型
+    const cur = rec.agent?.options;
+    const model = (cur?.provider && cur?.model)
+      ? { provider: cur.provider, model: cur.model }
+      : this.defaultModel();
     const record = await this.agents.create({
       sessionId: newId,
       seed,
@@ -472,7 +491,7 @@ export class SessionBridge {
         parentSession: rec.agent.session.id,
         seedLength: seed.length,
       },
-      agentOptions: this.agentOptions(),
+      ...(model ? { agentOptions: model } : {}),
     });
     this.record = record;
     this.sessionId = newId;

@@ -8,8 +8,6 @@
       config:
         # 默认配置（用户可在 profile 的 cordis.patch.yml 覆盖）
         OMLX_BASE_URL: http://macmini.local:12345/v1
-        ASR_MODEL: Qwen3-ASR-0.6B-4bit
-        LLM_MODEL: Qwen3.6-35B-A3B-4bit
         LLM_PROVIDER: omlx
         SESSION_KEY: ptt-main
         GAMEPAD_BACKEND: pygame
@@ -30,3 +28,37 @@
         HELP_KEYWORDS: [help, 帮助, 有什么命令, 有哪些命令]
         COMPACT_KEYWORDS: [compact, 压缩, 压缩一下]
         GOAL_KEYWORDS: [goal, 目标, 当前目标]
+
+        # ═══════════════════════════════════════════════════════════════
+        # PTT_* 可设置项：同名去掉 PTT_ 前缀写在这里
+        # （环境变量 PTT_xxx 优先于本处配置；都没有才用代码内 ENV_DEFAULTS 默认）
+        # ═══════════════════════════════════════════════════════════════
+
+        # ── 输入 / 输出 ──
+        INPUT_TEXT: stdin            # PTT_INPUT_TEXT：stdin | ws | none
+        INPUT_AUDIO: gamepad         # PTT_INPUT_AUDIO：gamepad | vad | mic | ws | none
+        INPUT_IMAGE: none            # PTT_INPUT_IMAGE：ws | none
+        OUTPUT_TEXT: stdout          # PTT_OUTPUT_TEXT：stdout | ws | none
+        OUTPUT_AUDIO: auto           # PTT_OUTPUT_AUDIO：say|aplay|afplay|ffplay|ws|none|auto
+        WS_URL: ''                   # PTT_WS_URL：ws://host:port（音频/文字走 ws 时必填）
+
+        # ── 三个模型 ──
+        MODEL_LLM: Qwen3.6-35B-A3B-4bit           # PTT_MODEL_LLM：语言模型（模型名，或 provider/model）
+        MODEL_ASR: Qwen3-ASR-0.6B-4bit            # PTT_MODEL_ASR：语音识别模型
+        MODEL_TTS: Qwen3-TTS-12Hz-0.6B-Base-4bit  # PTT_MODEL_TTS：语音合成模型
+
+        # ── 语音合成 TTS ──
+        TTS: say                     # PTT_TTS：say | openai | none
+        TTS_URL: ''                  # PTT_TTS_URL（空=用 OMLX_BASE_URL）
+        TTS_KEY: ''                  # PTT_TTS_KEY（空=用 OMLX_API_KEY）
+        TTS_VOICE: alloy             # PTT_TTS_VOICE
+        TTS_MAXSIZE: ''              # PTT_TTS_MAXSIZE：单次最大字数，空=不分段
+
+        # ── 语音识别 ASR ──
+        ASR: openai                  # PTT_ASR：openai | none
+        ASR_URL: ''                  # PTT_ASR_URL（空=用 OMLX_BASE_URL）
+        ASR_API: transcribe          # PTT_ASR_API
+        ASR_KEY: ''                  # PTT_ASR_KEY（空=用 OMLX_API_KEY）
+
+        # ── 日志 ──
+        VERBOSE: false               # PTT_VERBOSE：true=启动打印「全部会话」等冗余信息

@@ -24,9 +24,11 @@ export const inject = ['agents', 'credentials', 'llm', 'agentDefaultModel', 'com
 const DEFAULTS = {
   OMLX_BASE_URL: 'http://macmini.local:12345/v1',
   OMLX_API_KEY: '52755227',
-  ASR_MODEL: 'Qwen3-ASR-0.6B-4bit',
-  LLM_MODEL: 'Qwen3.6-35B-A3B-4bit',
-  LLM_PROVIDER: 'omlx',
+  // ── 三个模型（对应环境变量 PTT_MODEL_LLM / PTT_MODEL_ASR / PTT_MODEL_TTS）──
+  MODEL_LLM: 'Qwen3.6-35B-A3B-4bit',       // 语言模型：模型名，或 provider/model（含 / 时拆开）
+  MODEL_ASR: 'Qwen3-ASR-0.6B-4bit',        // 语音识别模型
+  MODEL_TTS: 'Qwen3-TTS-12Hz-0.6B-Base-4bit', // 语音合成模型
+  LLM_PROVIDER: 'omlx',                    // 语言模型 provider（MODEL_LLM 含 / 时以其中为准）
   SESSION_KEY: 'ptt-main', // 会话标识：改这个 = 换一个全新主会话（历史互不相通）
   GAMEPAD_BACKEND: 'node-hid',
   PYTHON_BIN: 'python3',
@@ -52,6 +54,8 @@ const DEFAULTS = {
 
   // 调试：true 时 ASR 结果只打印，不发给模型、不执行命令
   ASR_DEBUG: false,
+  // 详细日志：true 时启动打印「全部会话」等冗余信息（默认 false 减噪）
+  VERBOSE: false,
 };
 
 /** 解析 /cmd 文本里的参数（第一个 token 之后的部分） */
@@ -69,7 +73,7 @@ function cmdArg(cmdText) {
 async function detectBestTts(env, cfg) {
   const baseUrl = (env.PTT_TTS_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
   const apiKey = env.PTT_TTS_KEY || cfg.OMLX_API_KEY || '';
-  const model = env.PTT_TTS_MODEL || 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
+  const model = env.PTT_MODEL_TTS || cfg.MODEL_TTS || '';
   // ① openai：有 omlx 配置 → 查模型；查不到也尽量用 openai（服务器可能开着）
   if (baseUrl) {
     try {
@@ -108,7 +112,7 @@ async function detectBestTts(env, cfg) {
 async function detectBestAsr(env, cfg) {
   const baseUrl = (env.PTT_ASR_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
   const apiKey = env.PTT_ASR_KEY || cfg.OMLX_API_KEY || '';
-  const model = env.PTT_ASR_MODEL || cfg.ASR_MODEL || '';
+  const model = env.PTT_MODEL_ASR || cfg.MODEL_ASR || '';
   if (!baseUrl || !model) return 'none';
   try {
     const res = await fetch(`${baseUrl}/models`, {
@@ -495,11 +499,11 @@ export async function apply(ctx, config) {
     PTT_INPUT_AUDIO: 'gamepad',    // 音频输入：gamepad(手柄+录音,gamepad.py) | vad(语音VAD,vad.py) | mic(纯麦克风,占位) | ws | none
     PTT_OUTPUT_TEXT: 'stdout',     // 文本输出：stdout(终端) | ws | none
     PTT_OUTPUT_AUDIO: 'auto',      // 语音输出：say(macOS) | ws | none；auto=自动检测（macOS+有say才say，否则none）
-    PTT_MODEL: '',                 // LLM 模型 provider/model（如 omlx/Qwen3.6-35B-A3B-4bit），空=用配置
+    PTT_MODEL_LLM: '',             // 语言模型：模型名，或 provider/model（如 omlx/Qwen3.6-35B-A3B-4bit）；空=用配置
     PTT_WS_URL: '',                // ws 输入/输出地址（PTT_INPUT_AUDIO=ws 或 PTT_OUTPUT_AUDIO=ws 时必填）
     PTT_TTS: 'say',                // 语音合成：say(macOS) | openai(omlx /v1/audio/speech) | none
     PTT_TTS_URL: '',               // openai TTS 端点（默认用 OMLX_BASE_URL）
-    PTT_TTS_MODEL: '',             // openai TTS 模型名（默认 Qwen3-TTS-12Hz-0.6B-Base-4bit）
+    PTT_MODEL_TTS: '',             // 语音合成模型名（空=用配置 MODEL_TTS）
     PTT_TTS_KEY: '',               // openai TTS key（默认用 OMLX_API_KEY）
     PTT_TTS_VOICE: 'alloy',        // openai TTS 音色
     PTT_TTS_MAXSIZE: '',           // 单次 TTS 最大字数；设了则按句末切块（服务器超时用），空=不分
@@ -507,24 +511,54 @@ export async function apply(ctx, config) {
     PTT_ASR_URL: '',               // ASR 端点（默认用 OMLX_BASE_URL）
     PTT_ASR_API: 'transcribe',     // ASR API 路径（transcribe = /audio/transcriptions）
     PTT_ASR_KEY: '',               // ASR key（默认用 OMLX_API_KEY）
-    PTT_ASR_MODEL: '',             // ASR 模型名（默认用 ASR_MODEL）
+    PTT_MODEL_ASR: '',             // 语音识别模型名（空=用配置 MODEL_ASR）
     PTT_INPUT_IMAGE: 'none',       // 图片输入：ws(经 ws 收图片/图片+文字) | none；默认 none（与音频独立）
+    PTT_VERBOSE: '',               // 详细日志：1/true/yes/on=启动打印「全部会话」等冗余信息；空=用配置 VERBOSE
   };
-  // 读取原始值 → 计算最终采用（env 优先 → 默认；ASR 空值回退配置）
+  // 读取原始值（仅用于诊断打印）
   const envRaw = {};
   for (const name of Object.keys(ENV_DEFAULTS)) {
     envRaw[name] = process.env[name] ?? '(未设置)';
   }
+  // 环境变量名 → 运行时(cfg)键：统一为「去掉 PTT_ 前缀」（便于在 cordis.patch.yml 里同名配置）
+  const ENV_TARGET = {
+    PTT_INPUT_TEXT: 'INPUT_TEXT',
+    PTT_INPUT_AUDIO: 'INPUT_AUDIO',
+    PTT_INPUT_IMAGE: 'INPUT_IMAGE',
+    PTT_OUTPUT_TEXT: 'OUTPUT_TEXT',
+    PTT_OUTPUT_AUDIO: 'OUTPUT_AUDIO',
+    PTT_WS_URL: 'WS_URL',
+    PTT_MODEL_LLM: 'MODEL_LLM',
+    PTT_MODEL_ASR: 'MODEL_ASR',
+    PTT_MODEL_TTS: 'MODEL_TTS',
+    PTT_TTS: 'TTS',
+    PTT_TTS_URL: 'TTS_URL',
+    PTT_TTS_KEY: 'TTS_KEY',
+    PTT_TTS_VOICE: 'TTS_VOICE',
+    PTT_TTS_MAXSIZE: 'TTS_MAXSIZE',
+    PTT_ASR: 'ASR',
+    PTT_ASR_URL: 'ASR_URL',
+    PTT_ASR_API: 'ASR_API',
+    PTT_ASR_KEY: 'ASR_KEY',
+    PTT_VERBOSE: 'VERBOSE',
+  };
+  // 逐项解析（每项规则一致）：
+  //   ① 有环境变量 PTT_x → 用环境变量；② 无 → 从 cfg 取；③ cfg 也没有 → 用 ENV_DEFAULTS 默认
+  //   （解析结果先落到 env.PTT_x；后续智能探测/检查会再改 env.*，最后统一写回 cfg.*）
+  const nonEmpty = (v, d) => (v !== undefined && v !== '' ? v : d);
   const env = {};
   for (const [name, def] of Object.entries(ENV_DEFAULTS)) {
-    env[name] = process.env[name] ?? def;
+    const key = ENV_TARGET[name];
+    env[name] = key
+      ? nonEmpty(process.env[name], nonEmpty(cfg[key], def)) // env → cfg → 默认
+      : (process.env[name] ?? def); // 无对应 cfg 键时的兜底（当前 ENV_TARGET 已覆盖全部）
   }
   env.PTT_ASR_URL ||= cfg.OMLX_BASE_URL ?? '';
   env.PTT_ASR_KEY ||= cfg.OMLX_API_KEY ?? '';
-  env.PTT_ASR_MODEL ||= cfg.ASR_MODEL ?? '';
+  env.PTT_MODEL_ASR ||= cfg.MODEL_ASR ?? '';
   env.PTT_TTS_URL ||= cfg.OMLX_BASE_URL ?? '';
   env.PTT_TTS_KEY ||= cfg.OMLX_API_KEY ?? '';
-  env.PTT_TTS_MODEL ||= 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
+  env.PTT_MODEL_TTS ||= cfg.MODEL_TTS ?? '';
   // PTT_TTS 未显式设置（空/未设）→ 智能探测可用合成器：①openai(调接口查模型) ②macOS say ③none
   // 先于 OUTPUT_AUDIO=auto 判断，因为 auto 要看 PTT_TTS 是否 openai
   if (!process.env.PTT_TTS) {
@@ -556,14 +590,14 @@ export async function apply(ctx, config) {
   if (!process.env.PTT_ASR) {
     env.PTT_ASR = await detectBestAsr(env, cfg);
   }
-  // PTT_MODEL=provider/model → 覆盖 LLM 配置
-  if (env.PTT_MODEL) {
-    const slash = env.PTT_MODEL.indexOf('/');
-    if (slash > 0 && slash < env.PTT_MODEL.length - 1) {
-      cfg.LLM_PROVIDER = env.PTT_MODEL.slice(0, slash);
-      cfg.LLM_MODEL = env.PTT_MODEL.slice(slash + 1);
+  // MODEL_LLM（env PTT_MODEL_LLM）=「模型名」或「provider/model」→ 解析到 LLM_PROVIDER / LLM_MODEL
+  if (env.PTT_MODEL_LLM) {
+    const slash = env.PTT_MODEL_LLM.indexOf('/');
+    if (slash > 0 && slash < env.PTT_MODEL_LLM.length - 1) {
+      cfg.LLM_PROVIDER = env.PTT_MODEL_LLM.slice(0, slash);
+      cfg.LLM_MODEL = env.PTT_MODEL_LLM.slice(slash + 1);
     } else {
-      out.log(`[ptt] ⚠️ PTT_MODEL 格式错误（应为 provider/model）: ${env.PTT_MODEL}`);
+      cfg.LLM_MODEL = env.PTT_MODEL_LLM; // 只给模型名 → provider 用 LLM_PROVIDER
     }
   }
   cfg.INPUT_AUDIO = env.PTT_INPUT_AUDIO;
@@ -572,17 +606,20 @@ export async function apply(ctx, config) {
   cfg.OUTPUT_TEXT = env.PTT_OUTPUT_TEXT;
   cfg.OUTPUT_AUDIO = env.PTT_OUTPUT_AUDIO;
   cfg.WS_URL = env.PTT_WS_URL;
-  cfg.PTT_TTS = env.PTT_TTS;
-  cfg.PTT_TTS_URL = env.PTT_TTS_URL;
-  cfg.PTT_TTS_MODEL = env.PTT_TTS_MODEL;
-  cfg.PTT_TTS_KEY = env.PTT_TTS_KEY;
-  cfg.PTT_TTS_VOICE = env.PTT_TTS_VOICE;
-  cfg.PTT_TTS_MAXSIZE = env.PTT_TTS_MAXSIZE;
-  cfg.PTT_ASR = env.PTT_ASR;
-  cfg.PTT_ASR_URL = env.PTT_ASR_URL;
-  cfg.PTT_ASR_API = env.PTT_ASR_API;
-  cfg.PTT_ASR_KEY = env.PTT_ASR_KEY;
-  cfg.PTT_ASR_MODEL = env.PTT_ASR_MODEL;
+  cfg.MODEL_LLM = env.PTT_MODEL_LLM;
+  cfg.MODEL_ASR = env.PTT_MODEL_ASR;
+  cfg.MODEL_TTS = env.PTT_MODEL_TTS;
+  cfg.TTS = env.PTT_TTS;
+  cfg.TTS_URL = env.PTT_TTS_URL;
+  cfg.TTS_KEY = env.PTT_TTS_KEY;
+  cfg.TTS_VOICE = env.PTT_TTS_VOICE;
+  cfg.TTS_MAXSIZE = env.PTT_TTS_MAXSIZE;
+  cfg.ASR = env.PTT_ASR;
+  cfg.ASR_URL = env.PTT_ASR_URL;
+  cfg.ASR_API = env.PTT_ASR_API;
+  cfg.ASR_KEY = env.PTT_ASR_KEY;
+  // PTT_VERBOSE：1/true/yes/on 为真（已按 env → cfg 解析到 env.PTT_VERBOSE）
+  cfg.VERBOSE = /^(1|true|yes|on)$/i.test(String(env.PTT_VERBOSE).trim());
 
   // 启动自检：确认 LLM 凭据可解析
   // （OMLX_API_KEY 存在 ~/.dsh/.credentials.yaml，llm-deepseek 的 apiKeyEnv 指向它）
@@ -993,12 +1030,12 @@ export async function apply(ctx, config) {
   } else if (cfg.OUTPUT_AUDIO === 'ws') {
     speaker.say = async (text) => {
       // TTS 不可用（PTT_TTS=none）→ 打印报错、不生成 wav、不崩溃
-      if (cfg.PTT_TTS === 'none') {
+      if (cfg.TTS === 'none') {
         out.error('[ptt] ⚠️ 无有效TTS工具（PTT_TTS=none），发送wav给ws失败，已跳过语音');
         return;
       }
       // 设了 PTT_TTS_MAXSIZE → 切块合成到分片文件，ffmpeg 合并后一次性广播
-      if (Number(cfg.PTT_TTS_MAXSIZE || 0) > 0) {
+      if (Number(cfg.TTS_MAXSIZE || 0) > 0) {
         const paths = await synthesizeSplit(text, cfg, out);
         if (paths.length === 0) { out.error('[ptt] ❌ TTS 未生成音频，无法发送给 ws'); return; }
         if (paths.length === 1) {

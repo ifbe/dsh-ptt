@@ -82,11 +82,11 @@ dsh --profile ptt
 | `PTT_INPUT_IMAGE` | ws / none | none | ws 图片输入（与音频独立） |
 | `PTT_OUTPUT_TEXT` | stdout / ws / none | stdout | 文本输出 |
 | `PTT_OUTPUT_AUDIO` | say / aplay / afplay / ffplay / ws / none / auto | auto | 语音输出方式；auto=按 PTT_TTS 决定（say→say；openai→本地播放器 aplay/afplay/ffplay），值即实际播放器 |
-| `PTT_MODEL` | provider/model | 空 | 覆盖 LLM 模型 |
+| `PTT_MODEL_LLM` | model 或 provider/model | MODEL_LLM | 语言模型（覆盖配置） |
 | `PTT_WS_URL` | ws://host:port | 空 | ws 地址（音频/文字走 ws 时必填，兼作 web 界面） |
 | `PTT_TTS` | say / openai / none | 自动探测 | 语音合成；未设置时按 ①openai(调 /v1/models 查模型) ②macOS say ③none 自动选 |
 | `PTT_TTS_URL` | url | OMLX_BASE_URL | openai TTS 端点（`/v1/audio/speech`） |
-| `PTT_TTS_MODEL` | model | Qwen3-TTS-12Hz-0.6B-Base-4bit | openai TTS 模型 |
+| `PTT_MODEL_TTS` | model | MODEL_TTS | 语音合成模型 |
 | `PTT_TTS_KEY` | key | OMLX_API_KEY | openai TTS key |
 | `PTT_TTS_VOICE` | voice | alloy | openai TTS 音色 |
 | `PTT_TTS_MAXSIZE` | num | 空 | 单次 TTS 最大字数；设了则按句末切块（换行>句号>其他符号，无则硬切，最多 50 块），本地依次播、ws 用 ffmpeg `-c copy` 合并一次发；空=不分 |
@@ -94,7 +94,8 @@ dsh --profile ptt
 | `PTT_ASR_URL` | url | OMLX_BASE_URL | ASR 端点 |
 | `PTT_ASR_API` | transcribe | transcribe | ASR 接口路径 |
 | `PTT_ASR_KEY` | key | OMLX_API_KEY | ASR key |
-| `PTT_ASR_MODEL` | model | ASR_MODEL | ASR 模型名 |
+| `PTT_MODEL_ASR` | model | MODEL_ASR | 语音识别模型 |
+| `PTT_VERBOSE` | 1 / true / yes / on | 空 | 详细日志：为真则启动打印「全部会话」等冗余信息；空=用配置 `VERBOSE` |
 
 ## 安装
 
@@ -105,7 +106,7 @@ dsh --profile ptt
 
 - **功能1（手柄）**还需 Python 依赖：`pip install pygame sounddevice numpy`（或 `pyaudio`）。推荐 Python **3.12**（3.10~3.13 均可；勿用 3.14 + pygame 2.6.1，会间歇崩溃）
 - **功能1（语音 VAD）**另需 `webrtcvad`（`pip install webrtcvad`，C 扩展，macOS 可能要现场编译；Raspberry Pi 用 `apt install python3-webrtcvad`）。麦克风采集用 `sounddevice`
-- LLM/ASR 模型通过 `settings.yaml` 的 `llm-pi-ai.providers.omlx` 配置，插件在 `cordis.patch.yml` 指定 `LLM_PROVIDER`/`LLM_MODEL`
+- LLM/ASR 模型通过 `settings.yaml` 的 `llm-pi-ai.providers.omlx` 配置，插件在 `cordis.patch.yml` 指定 `LLM_PROVIDER` 与 `MODEL_LLM`/`MODEL_ASR`/`MODEL_TTS`
 
 ## License
 

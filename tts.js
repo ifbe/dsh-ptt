@@ -67,7 +67,7 @@ export function splitTtsText(text, maxSize) {
  * @returns {Promise<string[]>} 分片 wav 路径
  */
 export async function synthesizeSplit(text, cfg, out) {
-  const maxSize = Number(cfg.PTT_TTS_MAXSIZE || 0);
+  const maxSize = Number(cfg.TTS_MAXSIZE || 0);
   if (!maxSize) {
     // 未设 → 原流程：整段合成，返回单个文件路径（统一名 tts.wav；若无 wav 则返回空）
     const r = await ttsWav(text, cfg, out);
@@ -109,10 +109,10 @@ async function sayWav(text, cfg, out, quiet) {
 async function openaiWav(text, cfg, out, quiet) {
   const input = cleanTtsText(text); // 换行/特殊标记符号/emoji → 空格，防乱读/切音色
   if (!quiet) out?.log?.(`[ptt] 🎤 TTS 合成中...（${input.length} 字）`);
-  const baseUrl = (cfg.PTT_TTS_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
-  const apiKey = cfg.PTT_TTS_KEY || cfg.OMLX_API_KEY || '';
-  const model = cfg.PTT_TTS_MODEL || 'Qwen3-TTS-12Hz-0.6B-Base-4bit';
-  const voice = cfg.PTT_TTS_VOICE || 'alloy';
+  const baseUrl = (cfg.TTS_URL || cfg.OMLX_BASE_URL || '').replace(/\/$/, '');
+  const apiKey = cfg.TTS_KEY || cfg.OMLX_API_KEY || '';
+  const model = cfg.MODEL_TTS || '';
+  const voice = cfg.TTS_VOICE || 'alloy';
   const body = JSON.stringify({ model, input, voice });
   const res = await fetch(`${baseUrl}/audio/speech`, {
     method: 'POST',
@@ -135,10 +135,10 @@ async function openaiWav(text, cfg, out, quiet) {
  */
 export async function ttsWav(text, cfg, out, quiet) {
   try {
-    if (cfg.PTT_TTS === 'none') return { error: '无有效TTS工具（PTT_TTS=none）' };
-    if (cfg.PTT_TTS === 'openai') return { wav: await openaiWav(text, cfg, out, quiet) };
-    if (cfg.PTT_TTS === 'say') return { wav: await sayWav(text, cfg, out, quiet) };
-    return { error: `未知 PTT_TTS=${cfg.PTT_TTS}` };
+    if (cfg.TTS === 'none') return { error: '无有效TTS工具（PTT_TTS=none）' };
+    if (cfg.TTS === 'openai') return { wav: await openaiWav(text, cfg, out, quiet) };
+    if (cfg.TTS === 'say') return { wav: await sayWav(text, cfg, out, quiet) };
+    return { error: `未知 PTT_TTS=${cfg.TTS}` };
   } catch (err) {
     return { error: err?.message ?? String(err) };
   }
@@ -160,7 +160,7 @@ export function wavPlayer() {
 
 /** 解析本地播放器：优先 PTT_TTS_PLAYER（用户指定），否则按 OS 探测。返回命令名或 null。 */
 export function resolvePlayer(cfg) {
-  if (cfg.PTT_TTS_PLAYER) return cfg.PTT_TTS_PLAYER;
+  if (cfg.TTS_PLAYER) return cfg.TTS_PLAYER;
   return wavPlayer();
 }
 

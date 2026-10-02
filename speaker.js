@@ -190,7 +190,7 @@ export class Speaker {
   /** 语音播报：入队串行播放（不并发不丢弃）。TTS 不可用时打印报错、不崩溃。 */
   say(text) {
     // PTT_TTS=none 但输出方式是本地 say（OUTPUT_AUDIO=say，macOS）→ 直接用 say 读文字，无需独立 TTS
-    if (this.config.PTT_TTS === 'none' && this.config.OUTPUT_AUDIO !== 'say') {
+    if (this.config.TTS === 'none' && this.config.OUTPUT_AUDIO !== 'say') {
       this.out.error('[ptt] ⚠️ 无有效TTS工具（PTT_TTS=none），播放语音失败，已跳过');
       return;
     }
@@ -214,9 +214,9 @@ export class Speaker {
   /** 播一条：openai → 合成 wav 本地播放；say → macOS 直接播 */
   async _playOne(text) {
     const cfg = this.config;
-    if (cfg.PTT_TTS === 'openai') {
+    if (cfg.TTS === 'openai') {
       // 设了 PTT_TTS_MAXSIZE → 切块合成到分片文件，依次本地播放
-      if (Number(cfg.PTT_TTS_MAXSIZE || 0) > 0) {
+      if (Number(cfg.TTS_MAXSIZE || 0) > 0) {
         const paths = await synthesizeSplit(text, cfg, this.out);
         for (const p of paths) {
           const perr = await playWavFile(p, cfg, this.out);
